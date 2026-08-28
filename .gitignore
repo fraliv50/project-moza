@@ -1,0 +1,23 @@
+# generated / outputs
+extracted/
+__pycache__/
+*.pyc
+.venv/
+termos/
+termos (!!)/
+* (!!).pdf
+*_stamped*.pdf
+*_final.pdf
+test_multi.pdf
+test_agnostic.pdf
+# keep only templates, ignore real bundles
+20LOC*.pdf
+22LOC*.pdf
+24LOC*.pdf
+2LOC*.pdf
+# but keep these two references
+!test file.pdf
+!example_1_fnb.pdf
+# OS
+Thumbs.db
+.DS_Store
