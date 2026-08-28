@@ -48,7 +48,7 @@ Invoice (p2): Rect(413.476, 651.229, 533.476, 681.279)
 DU      (p3): Rect(394.182, 781.424, 514.182, 811.474)
 ```
 
-`example_draft_rect(page, stamp_w, stamp_h, kind)` scales to page size `595×842` and clamps to `MARGIN 14` so `220pt` stamp stays visible. Tax Invoice & DU both follow draft. If you want Tax Invoice to prefer empty space first, `find_least_text_rect` falls back to draft when `overlap > 0.45*area`.
+`example_draft_rect(page, stamp_w, stamp_h, kind)` scales to page size `595×842` and clamps to `MARGIN 14` so the stamp stays visible. Tax Invoice & DU both follow draft. If you want Tax Invoice to prefer empty space first, `find_least_text_rect` falls back to draft when `overlap > 0.45*area`.
 
 ### Page-agnostic & future-proof
 
@@ -59,6 +59,15 @@ DU      (p3): Rect(394.182, 781.424, 514.182, 811.474)
 - **DUs**: only **FIRST** matching DU stamped (others ignored, continuation ignored)
 
 Validated via `ValidationReport`: UCR match, Invoice Total vs Termo, Valor Factura vs Termo, Invoice ref.
+
+### Fallback (when full automation can't run)
+
+If Termo / Tax Invoice / Documento Único aren't **all** found (e.g. scanned pages, shuffled/misspelled text), the file is **no longer skipped**:
+
+- The Termo is looked up **liberally** via details only it has — the full header `Termo de Compromisso de Intermediação Bancária para a Importação de Bens` (plus `intermediação bancária`, `importação de bens`, `compromisso`), accent-insensitive.
+- **Every page EXCEPT the Termo** gets a **date-only** stamp (`DD/MM/YYYY`); POR/SALDO stay blank for manual fill.
+- The Termo page is **never** stamped. If it can't be identified even liberally, the file is **skipped** (stamped nothing) to avoid stamping an unknown page.
+- Output prints `FALLBACK` so you know the end user must fill POR/SALDO. Only runs when the strict full path is unavailable — normal bundles behave exactly as before.
 
 ## Setup on another laptop (quick)
 
@@ -148,15 +157,18 @@ TEXT_POS = {"d1":(0.538,0.103), "d2":(0.633,0.103), "d3":(0.724,0.103), "por":(0
 # nudge: y -0.005 = up ~3.5px, x +0.01 = right ~12px
 ```
 
-**Stamp placement on page** — `core.py` `example_draft_rect` + `STAMP_WIDTH_PT`:
+**Stamp placement & size** — `core.py` `example_draft_rect` + `STAMP_INK_WIDTH_PT`:
 ```python
-STAMP_WIDTH_PT = 220.0  # width on page; height = 220/1.79≈123pt
+STAMP_INK_WIDTH_PT = 231.95  # original stamp ink on test file.pdf: 231.95 x 75.99 pt (measured)
+# stamp_template.png keeps paper margins, so stamp_rect_size() measures the template ink
+# fraction once and widens the placed rect until the VISIBLE stamp = 231.95 pt exactly.
 MARGIN = 14.0
+DU_DROP_SHARE = 1.10  # DU stamp lowered by 110% of its visible height (30%+30%+50%) ("du" kind only)
 # from example_1_fnb.pdf blue Draft annots:
 # invoice x0_src,y0_src = 413.47,651.22  du = 394.18,781.42 (for 595×842 page)
 # scaled: x0 = x0_src * (pw/595), y0 = y0_src * (ph/842), then clamped to MARGIN
 ```
-Move stamp: change `x0_src`/`y0_src` (e.g. `y0_src+20` = down). Bigger stamp: `STAMP_WIDTH_PT=250`.
+Move stamp: change `x0_src`/`y0_src` (e.g. `y0_src+20` = down). Bigger/smaller stamp: change `STAMP_INK_WIDTH_PT` (width of visible ink in pt). DU drop: adjust `DU_DROP_SHARE` (`0` = back to draft position).
 
 After edit, test: `python macro_processes/macro_full.py ".\termos\test.pdf"` and check `extracted/trials/stamp_*.png`.
 
@@ -166,7 +178,7 @@ After edit, test: `python macro_processes/macro_full.py ".\termos\test.pdf"` and
 - `Termo/Invoice/DU page not found` → PDF must contain those markers text (Termo de Compromisso, Tax Invoice, DOCUMENTO ÚNICO)
 - `already exists SKIP` in batch → delete ` (!!).pdf` or run on copy
 - Stamp text touches line → adjust `TEXT_POS` y `-0.005` in `core.py`/`stamp_pdf.py` and rebuild `assets/stamp_template.png` if needed
-- Need different stamp size → change `STAMP_WIDTH_PT = 220.0` in `core.py`
+- Need different stamp size → change `STAMP_INK_WIDTH_PT = 231.95` in `core.py` (and `stamp_pdf.py`)
 
 ## Closing changes placeholder
 

@@ -9,33 +9,9 @@ import sys
 from pathlib import Path
 import fitz
 from PIL import Image, ImageDraw, ImageFont
-from core import ensure_stamp_template, _load_font, TEXT_POS, stamp_rect_size, example_draft_rect, place_stamp, find_all_pages_by_marker, find_du_pages, extract_termo_data, validate_bundle, ValidationReport, STAMP_TEMPLATE, today_pt
+from core import ensure_stamp_template, _load_font, TEXT_POS, stamp_rect_size, example_draft_rect, place_stamp, find_all_pages_by_marker, find_du_pages, extract_termo_data, validate_bundle, ValidationReport, today_pt, build_date_stamp, apply_date_fallback
 
 ROOT = Path(__file__).resolve().parent.parent
-
-def build_date_stamp(stamp_date: str) -> tuple[bytes, float]:
-    template_path = ensure_stamp_template()
-    img = Image.open(template_path).convert("RGBA")
-    w, h = img.size
-    draw = ImageDraw.Draw(img)
-    parts = stamp_date.split("/")
-    d1, d2, d3 = (parts[0] if len(parts)>0 else "", parts[1] if len(parts)>1 else "", parts[2] if len(parts)>2 else "")
-    base_size = max(22, int(h * 0.038) + 6)
-    font = _load_font(base_size)
-    for key, text in (("d1", d1), ("d2", d2), ("d3", d3)):
-        fx, fy = TEXT_POS[key]
-        draw.text((int(w*fx), int(h*fy)), text, fill=(0,0,0,255), font=font, anchor="mm")
-    data = img.getdata()
-    trans = []
-    for r,g,b,a in data:
-        if r>=235 and g>=235 and b>=235:
-            trans.append((255,255,255,0))
-        else:
-            trans.append((r,g,b,a))
-    img.putdata(trans)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue(), w/h
 
 def apply(input_path: Path, output_path: Path | None = None, *, stamp_date: str | None = None, stamp_source: Path | None = None, dry_run: bool = False) -> ValidationReport:
     input_path = Path(input_path)
@@ -51,12 +27,26 @@ def apply(input_path: Path, output_path: Path | None = None, *, stamp_date: str 
     termo_indices = find_all_pages_by_marker(doc, ["Termo de Compromisso"])
     invoice_indices = find_all_pages_by_marker(doc, ["Tax Invoice", "Commercial Invoice"])
     du_indices = find_du_pages(doc)
-    if not termo_indices:
-        raise ValueError("Termo de Compromisso page not found")
-    if not invoice_indices:
-        raise ValueError("Tax Invoice / Commercial Invoice page not found")
-    if not du_indices:
-        raise ValueError("Documento Único page not found")
+    if not (termo_indices and invoice_indices and du_indices):
+        missing = []
+        if not termo_indices:
+            missing.append("Termo de Compromisso")
+        if not invoice_indices:
+            missing.append("Tax Invoice / Commercial Invoice")
+        if not du_indices:
+            missing.append("Documento Único")
+        print(f"FALLBACK — missing {', '.join(missing)}; date-only stamp on non-Termo pages (POR/SALDO leave blank)")
+        report, stamped = apply_date_fallback(doc, output_path, termo_indices, invoice_indices, du_indices, stamp_date, dry_run)
+        print(f"Input: {input_path}")
+        print(f"Output: {output_path}")
+        print(f"Date: {stamp_date}")
+        for pno, kind, r in stamped:
+            print(f"  p{pno} [{kind}] date-only: {r}")
+        if not dry_run:
+            print(f"\nSaved: {output_path}")
+        doc.close()
+        report.print_report()
+        return report
     termo = extract_termo_data(doc[termo_indices[0]].get_text())
     termo.page_idx = termo_indices[0]
     du_text = doc[du_indices[0]].get_text()

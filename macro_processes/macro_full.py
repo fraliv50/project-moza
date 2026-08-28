@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 import fitz
 from PIL import Image, ImageDraw, ImageFont
-from core import ensure_stamp_template, _load_font, TEXT_POS, STAMP_TEMPLATE, POR_SUFFIX, SALDO_TEXT, stamp_rect_size, example_draft_rect, place_stamp, find_all_pages_by_marker, find_du_pages, extract_termo_data, extract_ucr_from_du, validate_bundle, ValidationReport, format_pt_amount, today_pt
+from core import ensure_stamp_template, _load_font, TEXT_POS, STAMP_TEMPLATE, POR_SUFFIX, SALDO_TEXT, stamp_rect_size, example_draft_rect, place_stamp, find_all_pages_by_marker, find_du_pages, extract_termo_data, extract_ucr_from_du, validate_bundle, ValidationReport, format_pt_amount, today_pt, apply_date_fallback
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -70,12 +70,26 @@ def apply(input_path: Path, output_path: Path | None = None, *, stamp_date: str 
     termo_indices = find_all_pages_by_marker(doc, ["Termo de Compromisso"])
     invoice_indices = find_all_pages_by_marker(doc, ["Tax Invoice", "Commercial Invoice"])
     du_indices_all = find_du_pages(doc)
-    if not termo_indices:
-        raise ValueError("Termo de Compromisso page not found (page-agnostic)")
-    if not invoice_indices:
-        raise ValueError("Tax Invoice / Commercial Invoice page not found")
-    if not du_indices_all:
-        raise ValueError("Documento Único page not found")
+    if not (termo_indices and invoice_indices and du_indices_all):
+        missing = []
+        if not termo_indices:
+            missing.append("Termo de Compromisso")
+        if not invoice_indices:
+            missing.append("Tax Invoice / Commercial Invoice")
+        if not du_indices_all:
+            missing.append("Documento Único")
+        print(f"FALLBACK — missing {', '.join(missing)}; date-only stamp on non-Termo pages (POR/SALDO leave blank)")
+        report, stamped = apply_date_fallback(doc, output_path, termo_indices, invoice_indices, du_indices_all, stamp_date, dry_run)
+        print(f"Input: {input_path}")
+        print(f"Output: {output_path}")
+        print(f"Date: {stamp_date}")
+        for pno, kind, r in stamped:
+            print(f"  p{pno} [{kind}] date-only: {r}")
+        if not dry_run:
+            print(f"\nSaved: {output_path}")
+        doc.close()
+        report.print_report()
+        return report
     termo = extract_termo_data(doc[termo_indices[0]].get_text())
     termo.page_idx = termo_indices[0]
     du_idx = select_du_by_ucr(doc, du_indices_all, termo.ucr)

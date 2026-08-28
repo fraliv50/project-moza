@@ -16,6 +16,7 @@ from datetime import date
 from pathlib import Path
 
 import fitz
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 # Default paths relative to this script
@@ -23,8 +24,12 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_STAMP_SOURCE = ROOT / "test file.pdf"
 STAMP_TEMPLATE = ROOT / "assets" / "stamp_template.png"
 
-STAMP_WIDTH_PT = 220.0
+# Measured ink size of the original stamp on test file.pdf: 231.95 x 75.99 pt.
+# stamp_template.png also contains paper margins, so stamp_rect_size() measures the
+# ink fraction once and widens the placed rect so the VISIBLE stamp = 231.95 pt exactly.
+STAMP_INK_WIDTH_PT = 231.95
 MARGIN = 14.0
+DU_DROP_SHARE = 1.10  # DU stamp lowered by 110% of its visible height (30%+30%+50%)
 POR_SUFFIX = " EUR"
 SALDO_TEXT = "0,00 EUR"
 
@@ -111,8 +116,6 @@ def ensure_stamp_template(source_pdf: Path = DEFAULT_STAMP_SOURCE) -> Path:
     doc.close()
 
     full = Image.open(io.BytesIO(bi["image"])).convert("RGBA")
-    import numpy as np
-
     arr = np.array(full.convert("L"))
     h, w = arr.shape
     mask = arr[int(h * 0.4) :, :] < 240
@@ -290,6 +293,111 @@ def find_du_pages(doc: fitz.Document) -> list[int]:
     return filtered
 
 
+# --- Fallback: date-only stamping when full automation lacks detail ---
+# The Termo is identified by details that ONLY it has, mainly the full statement
+# "Termo de Compromisso de Intermediação Bancária para a Importação de Bens".
+import unicodedata
+
+
+def _fold_text(s: str) -> str:
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return s.replace("\ufffd", " ").lower()
+
+
+TERMO_LIBERAL_SIGNALS = (
+    "termo de compromisso de intermediacao bancaria para a importacao de bens",
+    "intermediacao bancaria",
+    "importacao de bens",
+    "termo de compromisso",
+    "compromisso",
+)
+
+
+def find_termo_pages(doc: fitz.Document) -> list[int]:
+    """Termo lookup: strict marker first, then liberal scan for termo-only details."""
+    strict = find_all_pages_by_marker(doc, ["Termo de Compromisso"])
+    if strict:
+        return strict
+    out = []
+    for i, page in enumerate(doc):
+        low = _fold_text(page.get_text())
+        if any(s in low for s in TERMO_LIBERAL_SIGNALS):
+            out.append(i)
+    return sorted(out)
+
+
+def build_date_stamp(stamp_date: str) -> tuple[bytes, float]:
+    """Stamp with today's date filled only (POR/SALDO left for manual fill)."""
+    template_path = ensure_stamp_template()
+    img = Image.open(template_path).convert("RGBA")
+    w, h = img.size
+    draw = ImageDraw.Draw(img)
+    parts = stamp_date.split("/")
+    d1 = parts[0] if len(parts) > 0 else ""
+    d2 = parts[1] if len(parts) > 1 else ""
+    d3 = parts[2] if len(parts) > 2 else ""
+    base_size = max(22, int(h * 0.038) + 6)
+    font = _load_font(base_size)
+    for key, text in (("d1", d1), ("d2", d2), ("d3", d3)):
+        fx, fy = TEXT_POS[key]
+        draw.text((int(w * fx), int(h * fy)), text, fill=(0, 0, 0, 255), font=font, anchor="mm")
+    data = img.getdata()
+    trans = []
+    for r, g, b, a in data:
+        if r >= 235 and g >= 235 and b >= 235:
+            trans.append((255, 255, 255, 0))
+        else:
+            trans.append((r, g, b, a))
+    img.putdata(trans)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue(), w / h
+
+
+def apply_date_fallback(
+    doc: fitz.Document,
+    output_path: Path,
+    termo_indices: list[int],
+    invoice_indices: list[int],
+    du_indices: list[int],
+    stamp_date: str,
+    dry_run: bool,
+) -> tuple[ValidationReport, list[tuple[int, str, tuple]]]:
+    """Best-effort fallback: stamp date-only on every page EXCEPT the Termo.
+
+    The Termo is never stamped. If it can't be identified even with the liberal
+    search, raises ValueError so the file is skipped instead of stamping unknowns.
+    """
+    report = ValidationReport()
+    termo_pages = termo_indices or find_termo_pages(doc)
+    if not termo_pages:
+        raise ValueError(
+            "Full automation unavailable AND Termo page not found even with liberal "
+            "search. Skipped without stamping (refusing to stamp an unidentified Termo)."
+        )
+    png_bytes, aspect = build_date_stamp(stamp_date)
+    stamp_w, stamp_h = stamp_rect_size(aspect)
+    stamped = []
+    for idx in range(len(doc)):
+        if idx in termo_pages:
+            continue
+        kind = "invoice" if idx in invoice_indices else ("du" if idx in du_indices else "invoice")
+        rect = example_draft_rect(doc[idx], stamp_w, stamp_h, kind)
+        if not dry_run:
+            place_stamp(doc[idx], rect, png_bytes)
+        stamped.append((idx + 1, kind, tuple(round(v, 1) for v in rect)))
+    if not dry_run:
+        doc.save(output_path, garbage=4, deflate=True)
+    report.add(
+        "FALLBACK (full automation unavailable)",
+        True,
+        f"date-only stamp on {len(stamped)} page(s); Termo page(s) "
+        f"{[p + 1 for p in termo_pages]} NOT stamped; POR/SALDO left for manual fill",
+    )
+    return report, stamped
+
+
 def select_du_by_ucr(doc: fitz.Document, du_indices: list[int], termo_ucr: str | None) -> int:
     if not du_indices:
         raise ValueError("No DU pages")
@@ -317,8 +425,43 @@ def page_occupied_rects(page: fitz.Page, y_min_ratio: float = 0.0) -> list[fitz.
     return rects
 
 
+_stamp_ink_fraction: float | None = None
+_stamp_ink_height_fraction: float | None = None
+
+
+def _measure_template_ink() -> None:
+    global _stamp_ink_fraction, _stamp_ink_height_fraction
+    ensure_stamp_template()
+    img = Image.open(STAMP_TEMPLATE).convert("L")
+    arr = np.asarray(img)
+    m = arr < 240
+    cols = m.any(axis=0)
+    rows = m.any(axis=1)
+    xs = np.where(cols)[0]
+    ys = np.where(rows)[0]
+    ink_w = (xs.max() - xs.min() + 1) if len(xs) else img.width
+    ink_h = (ys.max() - ys.min() + 1) if len(ys) else img.height
+    _stamp_ink_fraction = ink_w / img.width
+    _stamp_ink_height_fraction = ink_h / img.height
+
+
+def stamp_ink_fraction() -> float:
+    """Fraction of template pixel width that is actual stamp ink (measured once)."""
+    if _stamp_ink_fraction is None:
+        _measure_template_ink()
+    return _stamp_ink_fraction
+
+
+def stamp_ink_height_fraction() -> float:
+    """Fraction of template pixel height that is actual stamp ink (measured once)."""
+    if _stamp_ink_height_fraction is None:
+        _measure_template_ink()
+    return _stamp_ink_height_fraction
+
+
 def stamp_rect_size(aspect: float) -> tuple[float, float]:
-    w = STAMP_WIDTH_PT
+    """Full placement rect so that the visible ink matches STAMP_INK_WIDTH_PT."""
+    w = STAMP_INK_WIDTH_PT / stamp_ink_fraction()
     h = w / aspect
     return w, h
 
@@ -335,6 +478,11 @@ def example_draft_rect(page: fitz.Page, stamp_w: float, stamp_h: float, kind: st
     y0 = y0_src * scale_y
     x0 = min(max(MARGIN, x0), pw - MARGIN - stamp_w)
     y0 = min(max(MARGIN, y0), ph - MARGIN - stamp_h)
+    if kind != "invoice":
+        # DU stamp lowered by DU_DROP_SHARE of its own visible (ink) height.
+        ink_h = stamp_h * stamp_ink_height_fraction()
+        y0 += DU_DROP_SHARE * ink_h
+        y0 = min(y0, ph - MARGIN - ink_h)
     return fitz.Rect(x0, y0, x0 + stamp_w, y0 + stamp_h)
 
 
@@ -457,12 +605,26 @@ def apply_stamps(
     invoice_indices = find_all_pages_by_marker(doc, ["Tax Invoice", "Commercial Invoice"])
     du_indices_all = find_du_pages(doc)
 
-    if not termo_indices:
-        raise ValueError("Termo de Compromisso page not found (page-agnostic)")
-    if not invoice_indices:
-        raise ValueError("Tax Invoice / Commercial Invoice page not found")
-    if not du_indices_all:
-        raise ValueError("Documento Único page not found")
+    if not (termo_indices and invoice_indices and du_indices_all):
+        missing = []
+        if not termo_indices:
+            missing.append("Termo de Compromisso")
+        if not invoice_indices:
+            missing.append("Tax Invoice / Commercial Invoice")
+        if not du_indices_all:
+            missing.append("Documento Único")
+        print(f"FALLBACK — missing {', '.join(missing)}; date-only stamp on non-Termo pages (POR/SALDO leave blank)")
+        report, stamped = apply_date_fallback(doc, output_path, termo_indices, invoice_indices, du_indices_all, stamp_date, dry_run)
+        print(f"Input:  {input_path}")
+        print(f"Output: {output_path}")
+        print(f"Date:   {stamp_date}")
+        for pno, kind, r in stamped:
+            print(f"  p{pno} [{kind}] date-only: {r}")
+        if not dry_run:
+            print(f"\nSaved: {output_path}")
+        doc.close()
+        report.print_report()
+        return report
 
     termo = extract_termo_data(doc[termo_indices[0]].get_text())
     termo.page_idx = termo_indices[0]
