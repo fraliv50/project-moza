@@ -16,10 +16,10 @@ ROOT = Path(__file__).resolve().parent.parent
 
 try:
     from macro_full import apply as apply_full
-    from core import today_pt
+    from core import today_pt, merge_pdfs, now_stamp, today_slug, outcome_to_row, error_row, skip_row, write_excel
 except ImportError:
     from macro_processes.macro_full import apply as apply_full
-    from macro_processes.core import today_pt
+    from macro_processes.core import today_pt, merge_pdfs, now_stamp, today_slug, outcome_to_row, error_row, skip_row, write_excel
 
 def find_termos_folders(root: Path) -> list[Path]:
     out = []
@@ -31,29 +31,44 @@ def find_termos_folders(root: Path) -> list[Path]:
             out.append(p)
     return sorted(out)
 
-def process_termos_folder(src_folder: Path) -> None:
+def process_termos_folder(src_folder: Path) -> list[dict]:
     dst_folder = src_folder.parent / (src_folder.name + " (!!)")
     dst_folder.mkdir(parents=True, exist_ok=True)
     pdfs = [p for p in src_folder.rglob("*.pdf") if p.is_file() and "(!!)" not in p.name]
     if not pdfs:
         print(f"[{src_folder.name}] no PDFs")
-        return
+        return []
     print(f"[{src_folder.name}] {len(pdfs)} PDFs -> {dst_folder.name}  Date: {today_pt()}")
     ok = 0
+    ts = now_stamp()
+    rows = []
     for pdf in sorted(pdfs):
         rel = pdf.relative_to(src_folder)
         out = dst_folder / rel.parent / (pdf.stem + " (!!)" + pdf.suffix)
         out.parent.mkdir(parents=True, exist_ok=True)
         if out.exists():
             print(f"  SKIP {rel} already stamped")
+            rows.append(skip_row(str(rel), out.name, ts))
             continue
         try:
-            apply_full(pdf, out)
-            print(f"  OK {rel} -> {out.relative_to(dst_folder)}")
+            oc = apply_full(pdf, out)
             ok += 1
+            print(f"  OK {rel} -> {out.relative_to(dst_folder)}")
+            rows.append(outcome_to_row(oc, str(rel), ts))
         except Exception as e:
             print(f"  FAIL {rel}: {e}")
+            rows.append(error_row(str(rel), out.name, str(e), ts))
+    merged_name = "merged (!!).pdf"
+    stamped_files = sorted(
+        p for p in dst_folder.rglob("*.pdf")
+        if p.is_file() and "(!!)" in p.name and p.name != merged_name
+    )
+    if stamped_files:
+        merged = dst_folder / merged_name
+        n = merge_pdfs(stamped_files, merged)
+        print(f"Merged {n} -> {merged}")
     print(f"Done {src_folder.name}: {ok}/{len(pdfs)} stamped -> {dst_folder}\n")
+    return rows
 
 def main(argv=None, watch: bool = False):
     import argparse
@@ -68,8 +83,17 @@ def main(argv=None, watch: bool = False):
         print(f"Create e.g. {ROOT/'termos' / '20LOC...pdf'} and rerun")
         if not args.watch:
             return
+    all_rows = []
     for f in folders:
-        process_termos_folder(f)
+        all_rows += process_termos_folder(f)
+
+    def flush():
+        if all_rows:
+            xl = ROOT / f"processadas_{today_slug()}.xlsx"
+            write_excel(list(all_rows), xl)
+            print(f"Excel: {xl} ({len(all_rows)} rows)")
+
+    flush()
     if args.watch or watch:
         print(f"Watching {ROOT} every {args.interval}s for new termos folders... Ctrl+C to stop")
         seen = set(str(p) for p in find_termos_folders(ROOT))
@@ -80,8 +104,9 @@ def main(argv=None, watch: bool = False):
                 for p in current:
                     if str(p) not in seen:
                         print(f"\nNew folder detected: {p.name}")
-                        process_termos_folder(p)
+                        all_rows += process_termos_folder(p)
                         seen.add(str(p))
+                        flush()
                     else:
                         # also check for new PDFs inside existing termos folders
                         pdfs = [x for x in p.rglob("*.pdf") if "(!!)" not in x.name]
@@ -94,7 +119,8 @@ def main(argv=None, watch: bool = False):
                                 need = True
                                 break
                         if need:
-                            process_termos_folder(p)
+                            all_rows += process_termos_folder(p)
+                            flush()
         except KeyboardInterrupt:
             print("\nStopped")
 

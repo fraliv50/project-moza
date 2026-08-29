@@ -58,16 +58,32 @@ DU      (p3): Rect(394.182, 781.424, 514.182, 811.474)
 - **Invoices**: `find_all_pages_by_marker(["Tax Invoice","Commercial Invoice"])` → **ALL** stamped
 - **DUs**: only **FIRST** matching DU stamped (others ignored, continuation ignored)
 
-Validated via `ValidationReport`: UCR match, Invoice Total vs Termo, Valor Factura vs Termo, Invoice ref.
+Validated via `ValidationReport`: UCR Termo↔DU, Invoice number triangle (`INVOICE:` on Termo ⇄ Tax Invoice ⇄ DU `13A Nº e data da factura`), Invoice Total ↔ Termo, DU FOB=Invoice FCA, DU Frete=Invoice Air Freight, DU CIF = FOB+FRETE+SEGURO, MT↔EUR conversion @ taxa de câmbio.
 
 ### Fallback (when full automation can't run)
 
-If Termo / Tax Invoice / Documento Único aren't **all** found (e.g. scanned pages, shuffled/misspelled text), the file is **no longer skipped**:
+If Termo / Tax Invoice / Documento Único aren't **all** found (e.g. scanned pages, shuffled/misspelled text), the file is **no longer skipped** — the program walks a safe ladder, using whatever it *can* find:
 
-- The Termo is looked up **liberally** via details only it has — the full header `Termo de Compromisso de Intermediação Bancária para a Importação de Bens` (plus `intermediação bancária`, `importação de bens`, `compromisso`), accent-insensitive.
-- **Every page EXCEPT the Termo** gets a **date-only** stamp (`DD/MM/YYYY`); POR/SALDO stay blank for manual fill.
-- The Termo page is **never** stamped. If it can't be identified even liberally, the file is **skipped** (stamped nothing) to avoid stamping an unknown page.
-- Output prints `FALLBACK` so you know the end user must fill POR/SALDO. Only runs when the strict full path is unavailable — normal bundles behave exactly as before.
+1. **POR-fill fallback** — if the Termo is found (strict or **liberal** scan of details only it has: `Termo de Compromisso de Intermediação Bancária para a Importação de Bens`, `intermediação bancária`, `importação de bens`, `compromisso`, accent-insensitive) **and** its `Valor do Termo de Compromisso` is extractable, the **FULL** stamp is used (`DD/MM/YYYY` + `POR` + `SALDO 0,00`) on every **identified** page — all Tax Invoices + the **first relevant DU** (UCR-matched when possible). This covers e.g. "invoice text is garbled but Termo+DU are fine".
+2. **Date-only fallback** — only when even POR can't be extracted: `DD/MM/YYYY` stamp on every page EXCEPT the Termo and DU continuations; POR/SALDO blank for manual fill.
+3. **Always skipped**: the Termo page and **`Documento Único (Continuação)`** sheets — only the first/main DU is ever stamped. If the Termo can't be identified even liberally, the file is **skipped** (stamped nothing) to avoid stamping an unknown page.
+4. Output prints `FALLBACK-POR` or `FALLBACK` so you know which mode ran. Normal bundles behave exactly as before (no fallback).
+
+### Merged output (print-all-at-once)
+
+While producing the individual ` (!!).pdf` copies, the batch/watch scripts also concatenate **all** of them into one file **in order**:
+
+- `batch_stamp.py` → `merged (!!).pdf` in the scanned root
+- `termos_auto.py` → `merged (!!).pdf` inside each `termos (!!)` output folder
+
+### Excel record (one workbook per run)
+
+At the end of every batch/watch run (`batch_stamp.py`, `termos_auto.py`) a workbook `processadas_<YYYY-MM-DD>.xlsx` is written (batch → scanned root, termos → project root):
+
+- **`Processadas`** — one row per bundle: run metadata (`processado_em`, `resultado` OK/FALLBACK-POR/FALLBACK-DATA/ERRO/SKIP, `ficheiro_origem`, `ficheiro_carimbado`, `detalhe_erro`, `paginas_carimbadas`), Termo party/IDs (`ref_termo`, `ucr`, `data_emissao`, `banco_emitente`, `modalidade`, `regime`, `transporte`, `mercadoria`, exporter/importer `nuit_/nome_/pais_`), EUR amounts (`valor_termo_eur`, `valor_factura_termo_eur`, `fca_eur`, `frete_eur`, `total_factura_eur`, `fob_eur`, `seguro_eur`, `frete_du_eur`, `cif_eur`), key IDs (`nr_factura`, `dt_factura`, `nr_declaracao`, `data_liquidacao`), `validacao_checks` (e.g. `13/13`) and `warns`.
+- **`Resumo`** — count per `resultado` plus `TOTAIS NAO-ERRO` sums of POR / CIF / total factura.
+
+Amounts are numbers, dates ISO `YYYY-MM-DD`, missing fields stay blank. No output is written on `--dry-run`.
 
 ## Setup on another laptop (quick)
 
@@ -78,7 +94,7 @@ If Termo / Tax Invoice / Documento Único aren't **all** found (e.g. scanned pag
 3. **Install deps** (one-time, in project folder):
 ```powershell
 python -m pip install --upgrade pip
-python -m pip install pymupdf Pillow numpy
+python -m pip install pymupdf Pillow numpy pandas openpyxl
 # if you have requirements.txt:
 # pip install -r requirements.txt
 ```

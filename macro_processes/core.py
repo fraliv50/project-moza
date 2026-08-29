@@ -38,6 +38,18 @@ class TermoData:
     ref_termo: str | None = None
     raw_valor_por: str | None = None
     page_idx: int = -1
+    nuit_exportador: str | None = None
+    nome_exportador: str | None = None
+    pais_exportador: str | None = None
+    nuit_importador: str | None = None
+    nome_importador: str | None = None
+    pais_importador: str | None = None
+    banco_emitente: str | None = None
+    data_emissao: str | None = None
+    modalidade: str | None = None
+    regime: str | None = None
+    transporte: str | None = None
+    mercadoria: str | None = None
 
 @dataclass
 class ValidationReport:
@@ -111,7 +123,23 @@ def _load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
             continue
     return ImageFont.load_default()
 
+# Recover glyphs the PDF font leaves as U+FFFD (no ToUnicode for accented chars).
+_MOJIBAKE_FIXES = {
+    "Importa��o": "Importação",
+    "A�reo": "Aéreo",
+    "Mo�ambique": "Moçambique",
+    "Pa�s": "País",
+}
+
+def _clean_text(s: str) -> str:
+    if not s:
+        return s
+    for bad, good in _MOJIBAKE_FIXES.items():
+        s = s.replace(bad, good)
+    return s
+
 def extract_termo_data(text: str) -> TermoData:
+    text = _clean_text(text)
     data = TermoData()
     m = re.search(r"N[ºo°]\s*de\s*Ref\.?\s*do\s*Termo\s*de\s*Compromisso\s+(\S+)", text, re.I)
     if m:
@@ -129,7 +157,69 @@ def extract_termo_data(text: str) -> TermoData:
     m = re.search(r"INVOICE:\s*(\S+)", text, re.I)
     if m:
         data.invoice_ref = m.group(1).strip()
+    lines = [ln.strip() for ln in text.splitlines()]
+    data.nuit_exportador = _field_after(lines, "NUIT do Exportador", "Nuit do Exportador")
+    data.nome_exportador = _field_after(lines, "Nome do Exportador")
+    data.pais_exportador = _field_after(lines, "País Exportador", "Pa�s Exportador", "Pais Exportador")
+    data.nuit_importador = _field_after(lines, "NUIT do Importador", "Nuit do Importador")
+    data.nome_importador = _field_after(lines, "Nome do Importador")
+    data.pais_importador = _field_after(lines, "País Importador", "Pa�s Importador", "Pais Importador")
+    data.banco_emitente = _field_after(lines, "Banco Emitente", "Banco Emissor")
+    data.modalidade = _field_after(lines, "Modalidade de Remessa/Pagamento", "Modalidade de Remessa / Pagamento")
+    data.regime = _field_after(lines, "Regime")
+    data.transporte = _field_after(lines, "Modo de Transporte", "Modo de Transporte/Rota")
+    data.mercadoria = _field_after(lines, "Mercadoria/bem", "Mercadoria / bem", "Mercadoria/ bem")
+    em = _field_after(lines, "Data de Emissão")
+    if em:
+        m = re.search(r"(\d{4})-(\d{2})-(\d{2})", em)
+        if m:
+            data.data_emissao = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
     return data
+
+def _squash(s: str | None) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _fold_text(s or ""))
+
+def _field_after(lines: list[str], *variants: str) -> str | None:
+    """Value that follows a label line (next non-empty line, or same line after ':').
+
+    Squashes whitespace/accents so it also matches corrupted encodings. Exact
+    label matches are tried first; a string-similarity fallback (threshold >= 0.9
+    plus shared 2-char prefix) only runs when NO exact variant matched anywhere,
+    catching labels that lost accented glyphs (\ufffd).
+    """
+    import difflib
+    sq = [_squash(ln) for ln in lines]
+    svs = [_squash(v) for v in variants]
+
+    def pick_from(i: int) -> str | None:
+        line = lines[i]
+        if ":" in line:
+            rest = line.split(":", 1)[1].strip()
+            if rest:
+                return rest
+        for j in range(i + 1, len(lines)):
+            v = lines[j].strip()
+            if v:
+                return v
+        return None
+
+    for sv in svs:
+        for i, q in enumerate(sq):
+            if q == sv or q.startswith(sv + ":"):
+                got = pick_from(i)
+                if got:
+                    return got
+    for sv in svs:
+        if len(sv) < 10:
+            continue
+        for i, q in enumerate(sq):
+            if len(q) < 8 or q[:2] != sv[:2]:
+                continue
+            if difflib.SequenceMatcher(None, q, sv).ratio() >= 0.9:
+                got = pick_from(i)
+                if got:
+                    return got
+    return None
 
 def extract_ucr_from_du(text: str) -> str | None:
     patterns = [
@@ -232,9 +322,12 @@ class DuFinancials:
     freight_mt: float | None = None
     insurance_mt: float | None = None
     cif_mt: float | None = None
+    decl_no: str | None = None
+    liqui_iso: str | None = None
 
 def extract_du_financials(text: str) -> DuFinancials:
     """Financial/factura block of the DU (fields 13A, 22, 23, 28, 24)."""
+    text = _clean_text(text)
     fin = DuFinancials()
     fin.ucr = extract_ucr_from_du(text)
     m = re.search(r"N[ºo°]\s*E\s*DATA\s+DA\s+(?:FACTURA|FATURA)", text, re.I)
@@ -276,6 +369,12 @@ def extract_du_financials(text: str) -> DuFinancials:
     m = re.search(r"TAXA\s+DE\s+C[ÂA]MBIO\s*\n?\s*([\d.,]+)", text, re.I)
     if m:
         fin.rate = _parse_amount(m.group(1))
+    m = re.search(r"N[ºo°]\s*DA\s*DECLARA[ÇC][ÃA]O[^\d]{0,24}(\d{6,15})", text, re.I)
+    if m:
+        fin.decl_no = m.group(1)
+    m = re.search(r"Data\s+de\s+liquida[çc][ãa]o[^\d]{0,24}(\d{2})/(\d{2})/(\d{4})", text, re.I)
+    if m:
+        fin.liqui_iso = f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
     return fin
 
 def find_all_pages_by_marker(doc: fitz.Document, markers: list[str]) -> list[int]:
@@ -353,6 +452,76 @@ def build_date_stamp(stamp_date: str) -> tuple[bytes, float]:
     img.save(buf, format="PNG")
     return buf.getvalue(), w / h
 
+def find_du_continuation_pages(doc: fitz.Document) -> list[int]:
+    """DU continuation sheets ('Documento Único (Continuação)') — never stamped."""
+    out = []
+    for idx in find_all_pages_by_marker(doc, ["DOCUMENTO ÚNICO", "DOCUMENTO UNICO"]):
+        if "continuacao" in _fold_text(doc[idx].get_text()):
+            out.append(idx)
+    return out
+
+def classify_pages(
+    doc: fitz.Document,
+    termo_indices: list[int],
+    invoice_indices: list[int],
+    du_indices: list[int],
+) -> list[tuple[int, str]]:
+    """Each page -> skip | invoice | du | unknown (Termo + DU continuations are never stamped)."""
+    termo = set(termo_indices)
+    inv = set(invoice_indices)
+    du = set(du_indices)
+    cont = set(find_du_continuation_pages(doc))
+    plan = []
+    for idx in range(len(doc)):
+        if idx in termo or idx in cont:
+            plan.append((idx, "skip"))
+        elif idx in inv:
+            plan.append((idx, "invoice"))
+        elif idx in du:
+            plan.append((idx, "du"))
+        else:
+            plan.append((idx, "unknown"))
+    return plan
+
+def select_du_by_ucr(doc: fitz.Document, du_indices: list[int], termo_ucr: str | None) -> int:
+    if not du_indices:
+        raise ValueError("No DU pages")
+    if not termo_ucr:
+        return du_indices[0]
+    for idx in du_indices:
+        ucr = extract_ucr_from_du(doc[idx].get_text())
+        if ucr and ucr.upper() == termo_ucr.upper():
+            return idx
+    return du_indices[0]
+
+def build_full_stamp(stamp_date: str, por_display: str, saldo: str = SALDO_TEXT) -> tuple[bytes, float]:
+    """Stamp with date + POR + SALDO filled."""
+    template_path = ensure_stamp_template()
+    img = Image.open(template_path).convert("RGBA")
+    w, h = img.size
+    draw = ImageDraw.Draw(img)
+    parts = stamp_date.split("/")
+    d1 = parts[0] if len(parts) > 0 else ""
+    d2 = parts[1] if len(parts) > 1 else ""
+    d3 = parts[2] if len(parts) > 2 else ""
+    por_text = f"{por_display}{POR_SUFFIX}"
+    base_size = max(22, int(h * 0.038) + 6)
+    fonts = {k: _load_font(base_size) for k in ("d1", "d2", "d3", "por", "saldo")}
+    for key, text in (("d1", d1), ("d2", d2), ("d3", d3), ("por", por_text), ("saldo", saldo)):
+        fx, fy = TEXT_POS[key]
+        draw.text((int(w * fx), int(h * fy)), text, fill=(0, 0, 0, 255), font=fonts[key], anchor="mm")
+    data = img.getdata()
+    trans = []
+    for r, g, b, a in data:
+        if r >= 235 and g >= 235 and b >= 235:
+            trans.append((255, 255, 255, 0))
+        else:
+            trans.append((r, g, b, a))
+    img.putdata(trans)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue(), w / h
+
 def apply_date_fallback(
     doc: fitz.Document,
     output_path: Path,
@@ -362,10 +531,10 @@ def apply_date_fallback(
     stamp_date: str,
     dry_run: bool,
 ) -> tuple[ValidationReport, list[tuple[int, str, tuple]]]:
-    """Best-effort fallback: stamp date-only on every page EXCEPT the Termo.
+    """Date-only stamp on every page EXCEPT the Termo and DU continuations.
 
-    The Termo is never stamped. If it can't be identified even with the liberal
-    search, raises ValueError so the file is skipped instead of stamping unknowns.
+    Unknown pages get the invoice placement so nothing real is missed. Raises
+    ValueError if the Termo can't be identified even with the liberal search.
     """
     report = ValidationReport()
     termo_pages = termo_indices or find_termo_pages(doc)
@@ -377,23 +546,151 @@ def apply_date_fallback(
     png_bytes, aspect = build_date_stamp(stamp_date)
     stamp_w, stamp_h = stamp_rect_size(aspect)
     stamped = []
-    for idx in range(len(doc)):
-        if idx in termo_pages:
+    for idx, kind in classify_pages(doc, termo_pages, invoice_indices, du_indices):
+        if kind == "skip":
             continue
-        kind = "invoice" if idx in invoice_indices else ("du" if idx in du_indices else "invoice")
-        rect = example_draft_rect(doc[idx], stamp_w, stamp_h, kind)
+        place_kind = "invoice" if kind == "unknown" else kind
+        rect = example_draft_rect(doc[idx], stamp_w, stamp_h, place_kind)
         if not dry_run:
             place_stamp(doc[idx], rect, png_bytes)
-        stamped.append((idx + 1, kind, tuple(round(v, 1) for v in rect)))
+        stamped.append((idx + 1, place_kind, tuple(round(v, 1) for v in rect)))
     if not dry_run:
         doc.save(output_path, garbage=4, deflate=True)
     report.add(
         "FALLBACK (full automation unavailable)",
         True,
         f"date-only stamp on {len(stamped)} page(s); Termo page(s) "
-        f"{[p + 1 for p in termo_pages]} NOT stamped; POR/SALDO left for manual fill",
+        f"{[p + 1 for p in termo_pages]} and DU continuations NOT stamped; POR/SALDO left for manual fill",
     )
     return report, stamped
+
+def apply_por_fallback(
+    doc: fitz.Document,
+    output_path: Path,
+    termo_pages: list[int],
+    invoice_indices: list[int],
+    du_indices: list[int],
+    por_display: str,
+    termo_ucr: str | None,
+    stamp_date: str,
+    dry_run: bool,
+) -> tuple[ValidationReport, list[tuple[int, str, tuple]]] | None:
+    """POR known: fill the FULL stamp (POR + SALDO 0,00) on identified pages only.
+
+    Stamps ALL invoices + the FIRST relevant DU (UCR-matched when possible).
+    DU continuations and unknown pages are never stamped here. Returns None when
+    no identified page exists so the caller can degrade to date-only.
+    """
+    png_bytes, aspect = build_full_stamp(stamp_date, por_display)
+    stamp_w, stamp_h = stamp_rect_size(aspect)
+    main_du = select_du_by_ucr(doc, sorted(du_indices), termo_ucr) if du_indices else None
+    stamped = []
+    for idx, kind in classify_pages(doc, termo_pages, invoice_indices, du_indices):
+        if kind == "invoice":
+            rect = example_draft_rect(doc[idx], stamp_w, stamp_h, "invoice")
+            if not dry_run:
+                place_stamp(doc[idx], rect, png_bytes)
+            stamped.append((idx + 1, "invoice", tuple(round(v, 1) for v in rect)))
+        elif kind == "du" and idx == main_du:
+            rect = example_draft_rect(doc[idx], stamp_w, stamp_h, "du")
+            if not dry_run:
+                place_stamp(doc[idx], rect, png_bytes)
+            stamped.append((idx + 1, "du", tuple(round(v, 1) for v in rect)))
+    if not stamped:
+        return None
+    if not dry_run:
+        doc.save(output_path, garbage=4, deflate=True)
+    report = ValidationReport()
+    report.add(
+        "FALLBACK-POR (partial automation)",
+        True,
+        f"full stamp (POR {por_display}{POR_SUFFIX}, SALDO {SALDO_TEXT}) on {len(stamped)} "
+        f"identified page(s); Termo p{[p + 1 for p in termo_pages]} and DU "
+        f"continuations/unknown pages NOT stamped",
+    )
+    return report, stamped
+
+def apply_auto_fallback(
+    doc: fitz.Document,
+    output_path: Path,
+    termo_indices: list[int],
+    invoice_indices: list[int],
+    du_indices: list[int],
+    stamp_date: str,
+    dry_run: bool,
+) -> BundleOutcome:
+    """Most automated safe fallback:
+
+    1. Find the Termo (strict markers, else liberal scan). Missing even liberally -> skip the file.
+    2. If the Termo's value (POR) is extractable -> FULL stamp on identified invoice/DU pages.
+    3. Otherwise -> date-only stamp on every non-Termo, non-DU-continuation page.
+    """
+    termo_pages = termo_indices or find_termo_pages(doc)
+    if not termo_pages:
+        raise ValueError(
+            "Full automation unavailable AND Termo page not found even with liberal "
+            "search. Skipped without stamping (refusing to stamp an unidentified Termo)."
+        )
+    missing = []
+    if not termo_indices:
+        missing.append("Termo (strict marker)")
+    if not invoice_indices:
+        missing.append("Tax Invoice")
+    if not du_indices:
+        missing.append("Documento Único")
+    termo = extract_termo_data(doc[termo_pages[0]].get_text())
+    termo.page_idx = termo_pages[0]
+    du_fin = extract_du_financials(doc[sorted(du_indices)[0]].get_text()) if du_indices else None
+    inv_text = doc[invoice_indices[0]].get_text() if invoice_indices else None
+    inv_details = extract_invoice_details(inv_text) if inv_text else {}
+    inv_no = (extract_invoice_number(inv_text) if inv_text else None) or (termo.invoice_ref or None) or ""
+    inv_date = extract_invoice_date(inv_text) if inv_text else None
+
+    def make_result(result: str, stamped: list[tuple[int, str, tuple]], report: ValidationReport) -> BundleOutcome:
+        warns = " | ".join(f"{nm}: {dt}" for nm, ok, dt in report.checks if not ok)
+        return BundleOutcome(
+            result=result,
+            output_name=str(output_path),
+            stamped_pages=",".join(str(pn) for pn, _, _ in stamped),
+            checks_ok=sum(1 for _, ok, _ in report.checks),
+            checks_total=len(report.checks),
+            warns=warns,
+            termo=termo,
+            du=du_fin,
+            inv=inv_details,
+            inv_no=inv_no or "",
+            inv_date=_iso_date(inv_date) or "",
+        )
+
+    if termo.valor_termo is not None:
+        por_display = format_pt_amount(termo.valor_termo)
+        got = apply_por_fallback(
+            doc, output_path, termo_pages, invoice_indices, du_indices,
+            por_display, termo.ucr, stamp_date, dry_run,
+        )
+        if got is not None:
+            fb_report, stamped = got
+            print(f"FALLBACK-POR — missing {', '.join(missing) or 'none (strict markers only)'}; "
+                  f"POR found in Termo => full stamp")
+            print(f"POR (from Termo p{termo_pages[0] + 1}): {por_display}{POR_SUFFIX} | SALDO: {SALDO_TEXT}")
+            for pno, kind, r in stamped:
+                print(f"  p{pno} [{kind}] full: {r}")
+            if not dry_run:
+                print(f"Saved: {output_path}")
+            fb_report.print_report()
+            return make_result("FALLBACK-POR", stamped, fb_report)
+    report, stamped = apply_date_fallback(
+        doc, output_path, termo_pages, invoice_indices, du_indices, stamp_date, dry_run,
+    )
+    reason = "POR known but no identifiable invoice/DU page to stamp" if termo.valor_termo is not None else "POR not extractable"
+    print(f"FALLBACK — missing {', '.join(missing) or 'none (strict markers only)'}; "
+          f"{reason} => date-only stamp (POR/SALDO left blank for manual fill)")
+    for pno, kind, r in stamped:
+        print(f"  p{pno} [{kind}] date-only: {r}")
+    if not dry_run:
+        print(f"Saved: {output_path}")
+    report.print_report()
+    return make_result("FALLBACK-DATA", stamped, report)
 
 _stamp_ink_fraction: float | None = None
 _stamp_ink_height_fraction: float | None = None
@@ -452,6 +749,20 @@ def example_draft_rect(page: fitz.Page, stamp_w: float, stamp_h: float, kind: st
 
 def place_stamp(page: fitz.Page, rect: fitz.Rect, png_bytes: bytes) -> None:
     page.insert_image(rect, stream=png_bytes, overlay=True)
+
+def merge_pdfs(sources: list[Path], output: Path) -> int:
+    """Concatenate PDFs in order into one file. Returns number of files merged."""
+    output = Path(output)
+    out = fitz.open()
+    try:
+        for p in sources:
+            with fitz.open(p) as src:
+                out.insert_pdf(src)
+        if out.page_count:
+            out.save(output, garbage=4, deflate=True)
+    finally:
+        out.close()
+    return len(sources)
 
 def validate_triangle(termo: TermoData, du_text: str, invoice_text: str, report: ValidationReport) -> None:
     """3-way invoice-number triangle (Termo INVOICE <-> Tax Invoice <-> DU 13A)
@@ -528,3 +839,146 @@ def validate_bundle(termo: TermoData, du_text: str, invoice_text: str, report: V
         report.add("Invoice Ref Termo vs Tax Invoice No", False, f"Termo INVOICE={termo.invoice_ref or '?'} | Invoice={inv_no or '?'}")
     validate_triangle(termo, du_text, invoice_text, report)
     return por
+
+# --- Excel record of every processed bundle ---
+
+@dataclass
+class BundleOutcome:
+    result: str = ""                                   # OK | FALLBACK-POR | FALLBACK-DATA | ERRO | SKIP
+    input_name: str = ""
+    output_name: str = ""
+    error: str = ""
+    stamped_pages: str = ""
+    checks_ok: int = 0
+    checks_total: int = 0
+    warns: str = ""
+    termo: TermoData | None = None
+    du: DuFinancials | None = None
+    inv: dict = field(default_factory=dict)
+    inv_no: str = ""
+    inv_date: str = ""
+
+EXCEL_COLUMNS = [
+    "processado_em", "resultado", "ficheiro_origem", "ficheiro_carimbado",
+    "detalhe_erro", "paginas_carimbadas",
+    "ref_termo", "ucr", "data_emissao", "banco_emitente", "modalidade",
+    "regime", "transporte", "mercadoria",
+    "nuit_exportador", "nome_exportador", "pais_exportador",
+    "nuit_importador", "nome_importador", "pais_importador",
+    "valor_termo_eur", "valor_factura_termo_eur",
+    "nr_factura", "dt_factura", "fca_eur", "frete_eur", "total_factura_eur",
+    "nr_declaracao", "fob_eur", "seguro_eur", "frete_du_eur", "cif_eur", "data_liquidacao",
+    "validacao_checks", "warns",
+]
+
+def _iso_date(s: str | None) -> str | None:
+    if not s:
+        return None
+    m = re.fullmatch(r"(\d{4})(\d{2})(\d{2})", s.strip())
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    m = re.fullmatch(r"(\d{2})/(\d{2})/(\d{4})", s.strip())
+    if m:
+        return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+    return s.strip()
+
+def today_slug() -> str:
+    d = date.today()
+    return f"{d.year:04d}-{d.month:02d}-{d.day:02d}"
+
+def now_stamp() -> str:
+    from datetime import datetime
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+def outcome_to_row(oc: BundleOutcome, input_name: str, processed_at: str) -> dict:
+    row = {c: None for c in EXCEL_COLUMNS}
+    t = oc.termo
+    du = oc.du
+    inv = oc.inv or {}
+    inv_no = oc.inv_no or ""
+    inv_date = oc.inv_date or ""
+    if not inv_no and du and du.invoice_ref:
+        inv_no = du.invoice_ref
+    if not inv_date and du and du.invoice_date:
+        inv_date = _iso_date(du.invoice_date) or ""
+    row.update({
+        "processado_em": processed_at,
+        "resultado": oc.result,
+        "ficheiro_origem": input_name,
+        "ficheiro_carimbado": oc.output_name,
+        "detalhe_erro": oc.error,
+        "paginas_carimbadas": oc.stamped_pages,
+    })
+    if t is not None:
+        row.update({
+            "ref_termo": t.ref_termo,
+            "ucr": t.ucr,
+            "data_emissao": t.data_emissao,
+            "banco_emitente": t.banco_emitente,
+            "modalidade": t.modalidade,
+            "regime": t.regime,
+            "transporte": t.transporte,
+            "mercadoria": t.mercadoria,
+            "nuit_exportador": t.nuit_exportador,
+            "nome_exportador": t.nome_exportador,
+            "pais_exportador": t.pais_exportador,
+            "nuit_importador": t.nuit_importador,
+            "nome_importador": t.nome_importador,
+            "pais_importador": t.pais_importador,
+            "valor_termo_eur": t.valor_termo,
+            "valor_factura_termo_eur": t.valor_factura,
+        })
+    row["nr_factura"] = inv_no
+    row["dt_factura"] = inv_date
+    if du is not None:
+        row.update({
+            "nr_declaracao": du.decl_no,
+            "fob_eur": du.fob,
+            "seguro_eur": du.insurance,
+            "frete_du_eur": du.freight,
+            "cif_eur": du.cif,
+            "data_liquidacao": du.liqui_iso,
+        })
+    if inv:
+        row.update({
+            "fca_eur": inv.get("goods"),
+            "frete_eur": inv.get("freight"),
+            "total_factura_eur": inv.get("total"),
+        })
+    if oc.checks_total:
+        row["validacao_checks"] = f"{oc.checks_ok}/{oc.checks_total}"
+    row["warns"] = oc.warns or None
+    return row
+
+def error_row(input_name: str, output_name: str, error: str, processed_at: str) -> dict:
+    oc = BundleOutcome(result="ERRO", input_name=input_name, output_name=output_name, error=error)
+    return outcome_to_row(oc, input_name, processed_at)
+
+def skip_row(input_name: str, output_name: str, processed_at: str) -> dict:
+    oc = BundleOutcome(result="SKIP", input_name=input_name, output_name=output_name)
+    return outcome_to_row(oc, input_name, processed_at)
+
+def write_excel(rows: list[dict], output_path: Path, summary: bool = True) -> Path:
+    """Write one workbook per run: 'Processadas' (one row per bundle) + 'Resumo'."""
+    import pandas as pd
+    output_path = Path(output_path)
+    df = pd.DataFrame([{c: r.get(c) for c in EXCEL_COLUMNS} for r in rows])
+    with pd.ExcelWriter(output_path, engine="openpyxl") as xw:
+        df.to_excel(xw, sheet_name="Processadas", index=False)
+        if summary and len(df):
+            sum_rows = []
+            for res, g in df.groupby(df["resultado"].fillna("?")):
+                sum_rows.append({"Resultado": res, "N": len(g)})
+            ok_df = df[df["resultado"].fillna("") != "ERRO"]
+            money = {
+                "Somatorio POR (EUR)": "valor_termo_eur",
+                "Somatorio CIF (EUR)": "cif_eur",
+                "Somatorio Total Factura (EUR)": "total_factura_eur",
+            }
+            row = {"Resultado": "TOTAIS NAO-ERRO", "N": len(ok_df)}
+            for label, col in money.items():
+                vals = pd.to_numeric(ok_df[col], errors="coerce")
+                row[label] = float(vals.sum()) if vals.notna().any() else 0.0
+            sum_rows.append(row)
+            pd.DataFrame(sum_rows).to_excel(xw, sheet_name="Resumo", index=False)
+    return output_path

@@ -5,58 +5,19 @@ Positions copied exactly from example_1_fnb.pdf blue Draft
 """
 from __future__ import annotations
 import argparse
-import io
 import sys
 from pathlib import Path
 import fitz
-from PIL import Image, ImageDraw, ImageFont
-from core import ensure_stamp_template, _load_font, TEXT_POS, STAMP_TEMPLATE, POR_SUFFIX, SALDO_TEXT, stamp_rect_size, example_draft_rect, place_stamp, find_all_pages_by_marker, find_du_pages, extract_termo_data, extract_ucr_from_du, validate_bundle, ValidationReport, format_pt_amount, today_pt, apply_date_fallback
+from core import (ensure_stamp_template, stamp_rect_size, example_draft_rect, place_stamp,
+                  find_all_pages_by_marker, find_du_pages, extract_termo_data, extract_ucr_from_du,
+                  extract_du_financials, extract_invoice_details, extract_invoice_number,
+                  extract_invoice_date, validate_bundle, ValidationReport, format_pt_amount,
+                  today_pt, build_full_stamp, select_du_by_ucr, apply_auto_fallback,
+                  BundleOutcome, _iso_date, POR_SUFFIX, SALDO_TEXT)
 
 ROOT = Path(__file__).resolve().parent.parent
 
-def build_full_stamp(stamp_date: str, por_display: str, saldo: str = SALDO_TEXT) -> tuple[bytes, float]:
-    template_path = ensure_stamp_template()
-    img = Image.open(template_path).convert("RGBA")
-    w, h = img.size
-    draw = ImageDraw.Draw(img)
-    parts = stamp_date.split("/")
-    d1, d2, d3 = (parts[0] if len(parts)>0 else "", parts[1] if len(parts)>1 else "", parts[2] if len(parts)>2 else "")
-    por_text = f"{por_display}{POR_SUFFIX}"
-    base_size = max(22, int(h * 0.038) + 6)
-    fonts = {
-        "d1": _load_font(base_size),
-        "d2": _load_font(base_size),
-        "d3": _load_font(base_size),
-        "por": _load_font(base_size),
-        "saldo": _load_font(base_size),
-    }
-    for key, text in (("d1", d1), ("d2", d2), ("d3", d3), ("por", por_text), ("saldo", saldo)):
-        fx, fy = TEXT_POS[key]
-        draw.text((int(w*fx), int(h*fy)), text, fill=(0,0,0,255), font=fonts[key], anchor="mm")
-    data = img.getdata()
-    trans = []
-    for r,g,b,a in data:
-        if r>=235 and g>=235 and b>=235:
-            trans.append((255,255,255,0))
-        else:
-            trans.append((r,g,b,a))
-    img.putdata(trans)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue(), w/h
-
-def select_du_by_ucr(doc: fitz.Document, du_indices: list[int], termo_ucr: str | None) -> int:
-    if not du_indices:
-        raise ValueError("No DU pages")
-    if not termo_ucr:
-        return du_indices[0]
-    for idx in du_indices:
-        ucr = extract_ucr_from_du(doc[idx].get_text())
-        if ucr and ucr.upper() == termo_ucr.upper():
-            return idx
-    return du_indices[0]
-
-def apply(input_path: Path, output_path: Path | None = None, *, stamp_date: str | None = None, stamp_source: Path | None = None, dry_run: bool = False) -> ValidationReport:
+def apply(input_path: Path, output_path: Path | None = None, *, stamp_date: str | None = None, stamp_source: Path | None = None, dry_run: bool = False) -> BundleOutcome:
     input_path = Path(input_path)
     if output_path is None:
         output_path = input_path.with_name(input_path.stem + "_stamped_full.pdf")
@@ -71,25 +32,13 @@ def apply(input_path: Path, output_path: Path | None = None, *, stamp_date: str 
     invoice_indices = find_all_pages_by_marker(doc, ["Tax Invoice", "Commercial Invoice"])
     du_indices_all = find_du_pages(doc)
     if not (termo_indices and invoice_indices and du_indices_all):
-        missing = []
-        if not termo_indices:
-            missing.append("Termo de Compromisso")
-        if not invoice_indices:
-            missing.append("Tax Invoice / Commercial Invoice")
-        if not du_indices_all:
-            missing.append("Documento Único")
-        print(f"FALLBACK — missing {', '.join(missing)}; date-only stamp on non-Termo pages (POR/SALDO leave blank)")
-        report, stamped = apply_date_fallback(doc, output_path, termo_indices, invoice_indices, du_indices_all, stamp_date, dry_run)
         print(f"Input: {input_path}")
         print(f"Output: {output_path}")
         print(f"Date: {stamp_date}")
-        for pno, kind, r in stamped:
-            print(f"  p{pno} [{kind}] date-only: {r}")
-        if not dry_run:
-            print(f"\nSaved: {output_path}")
+        oc = apply_auto_fallback(doc, output_path, termo_indices, invoice_indices, du_indices_all, stamp_date, dry_run)
         doc.close()
-        report.print_report()
-        return report
+        oc.input_name = str(input_path)
+        return oc
     termo = extract_termo_data(doc[termo_indices[0]].get_text())
     termo.page_idx = termo_indices[0]
     du_idx = select_du_by_ucr(doc, du_indices_all, termo.ucr)
@@ -121,7 +70,22 @@ def apply(input_path: Path, output_path: Path | None = None, *, stamp_date: str 
         print(f"\nSaved: {output_path}")
     doc.close()
     report.print_report()
-    return report
+    planned = [i + 1 for i in invoice_indices] + [du_idx + 1]
+    oc = BundleOutcome(
+        result="OK",
+        input_name=str(input_path),
+        output_name=str(output_path),
+        stamped_pages=",".join(map(str, planned)),
+        checks_ok=sum(1 for _, ok, _ in report.checks),
+        checks_total=len(report.checks),
+        warns=" | ".join(f"{nm}: {dt}" for nm, ok, dt in report.checks if not ok),
+        termo=termo,
+        du=extract_du_financials(du_text),
+        inv=extract_invoice_details(inv_text),
+        inv_no=(extract_invoice_number(inv_text) or termo.invoice_ref or ""),
+        inv_date=_iso_date(extract_invoice_date(inv_text)) or "",
+    )
+    return oc
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Macro Full — stamp + date + POR + SALDO, page-agnostic UCR, all invoices / first DU")

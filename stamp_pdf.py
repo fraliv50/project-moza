@@ -355,6 +355,39 @@ def build_date_stamp(stamp_date: str) -> tuple[bytes, float]:
     return buf.getvalue(), w / h
 
 
+def find_du_continuation_pages(doc: fitz.Document) -> list[int]:
+    """DU continuation sheets ('Documento Único (Continuação)') — never stamped."""
+    out = []
+    for idx in find_all_pages_by_marker(doc, ["DOCUMENTO ÚNICO", "DOCUMENTO UNICO"]):
+        if "continuacao" in _fold_text(doc[idx].get_text()):
+            out.append(idx)
+    return out
+
+
+def classify_pages(
+    doc: fitz.Document,
+    termo_indices: list[int],
+    invoice_indices: list[int],
+    du_indices: list[int],
+) -> list[tuple[int, str]]:
+    """Each page -> skip | invoice | du | unknown (Termo + DU continuations are never stamped)."""
+    termo = set(termo_indices)
+    inv = set(invoice_indices)
+    du = set(du_indices)
+    cont = set(find_du_continuation_pages(doc))
+    plan = []
+    for idx in range(len(doc)):
+        if idx in termo or idx in cont:
+            plan.append((idx, "skip"))
+        elif idx in inv:
+            plan.append((idx, "invoice"))
+        elif idx in du:
+            plan.append((idx, "du"))
+        else:
+            plan.append((idx, "unknown"))
+    return plan
+
+
 def apply_date_fallback(
     doc: fitz.Document,
     output_path: Path,
@@ -364,10 +397,10 @@ def apply_date_fallback(
     stamp_date: str,
     dry_run: bool,
 ) -> tuple[ValidationReport, list[tuple[int, str, tuple]]]:
-    """Best-effort fallback: stamp date-only on every page EXCEPT the Termo.
+    """Date-only stamp on every page EXCEPT the Termo and DU continuations.
 
-    The Termo is never stamped. If it can't be identified even with the liberal
-    search, raises ValueError so the file is skipped instead of stamping unknowns.
+    Unknown pages get the invoice placement so nothing real is missed. Raises
+    ValueError if the Termo can't be identified even with the liberal search.
     """
     report = ValidationReport()
     termo_pages = termo_indices or find_termo_pages(doc)
@@ -379,23 +412,125 @@ def apply_date_fallback(
     png_bytes, aspect = build_date_stamp(stamp_date)
     stamp_w, stamp_h = stamp_rect_size(aspect)
     stamped = []
-    for idx in range(len(doc)):
-        if idx in termo_pages:
+    for idx, kind in classify_pages(doc, termo_pages, invoice_indices, du_indices):
+        if kind == "skip":
             continue
-        kind = "invoice" if idx in invoice_indices else ("du" if idx in du_indices else "invoice")
-        rect = example_draft_rect(doc[idx], stamp_w, stamp_h, kind)
+        place_kind = "invoice" if kind == "unknown" else kind
+        rect = example_draft_rect(doc[idx], stamp_w, stamp_h, place_kind)
         if not dry_run:
             place_stamp(doc[idx], rect, png_bytes)
-        stamped.append((idx + 1, kind, tuple(round(v, 1) for v in rect)))
+        stamped.append((idx + 1, place_kind, tuple(round(v, 1) for v in rect)))
     if not dry_run:
         doc.save(output_path, garbage=4, deflate=True)
     report.add(
         "FALLBACK (full automation unavailable)",
         True,
         f"date-only stamp on {len(stamped)} page(s); Termo page(s) "
-        f"{[p + 1 for p in termo_pages]} NOT stamped; POR/SALDO left for manual fill",
+        f"{[p + 1 for p in termo_pages]} and DU continuations NOT stamped; POR/SALDO left for manual fill",
     )
     return report, stamped
+
+
+def apply_por_fallback(
+    doc: fitz.Document,
+    output_path: Path,
+    termo_pages: list[int],
+    invoice_indices: list[int],
+    du_indices: list[int],
+    por_display: str,
+    termo_ucr: str | None,
+    stamp_date: str,
+    dry_run: bool,
+) -> tuple[ValidationReport, list[tuple[int, str, tuple]]] | None:
+    """POR known: fill the FULL stamp (POR + SALDO 0,00) on identified pages only.
+
+    Stamps ALL invoices + the FIRST relevant DU (UCR-matched when possible).
+    DU continuations and unknown pages are never stamped here. Returns None when
+    no identified page exists so the caller can degrade to date-only.
+    """
+    png_bytes, aspect = build_filled_stamp(stamp_date, por_display)
+    stamp_w, stamp_h = stamp_rect_size(aspect)
+    main_du = select_du_by_ucr(doc, sorted(du_indices), termo_ucr) if du_indices else None
+    stamped = []
+    for idx, kind in classify_pages(doc, termo_pages, invoice_indices, du_indices):
+        if kind == "invoice":
+            rect = example_draft_rect(doc[idx], stamp_w, stamp_h, "invoice")
+            if not dry_run:
+                place_stamp(doc[idx], rect, png_bytes)
+            stamped.append((idx + 1, "invoice", tuple(round(v, 1) for v in rect)))
+        elif kind == "du" and idx == main_du:
+            rect = example_draft_rect(doc[idx], stamp_w, stamp_h, "du")
+            if not dry_run:
+                place_stamp(doc[idx], rect, png_bytes)
+            stamped.append((idx + 1, "du", tuple(round(v, 1) for v in rect)))
+    if not stamped:
+        return None
+    if not dry_run:
+        doc.save(output_path, garbage=4, deflate=True)
+    report = ValidationReport()
+    report.add(
+        "FALLBACK-POR (partial automation)",
+        True,
+        f"full stamp (POR {por_display}{POR_SUFFIX}, SALDO {SALDO_TEXT}) on {len(stamped)} "
+        f"identified page(s); Termo p{[p + 1 for p in termo_pages]} and DU "
+        f"continuations/unknown pages NOT stamped",
+    )
+    return report, stamped
+
+
+def apply_auto_fallback(
+    doc: fitz.Document,
+    output_path: Path,
+    termo_indices: list[int],
+    invoice_indices: list[int],
+    du_indices: list[int],
+    stamp_date: str,
+    dry_run: bool,
+) -> ValidationReport:
+    """Most automated safe fallback: POR-fill if possible, else date-only."""
+    report = ValidationReport()
+    termo_pages = termo_indices or find_termo_pages(doc)
+    if not termo_pages:
+        raise ValueError(
+            "Full automation unavailable AND Termo page not found even with liberal "
+            "search. Skipped without stamping (refusing to stamp an unidentified Termo)."
+        )
+    missing = []
+    if not termo_indices:
+        missing.append("Termo (strict marker)")
+    if not invoice_indices:
+        missing.append("Tax Invoice")
+    if not du_indices:
+        missing.append("Documento Único")
+    termo = extract_termo_data(doc[termo_pages[0]].get_text())
+    if termo.valor_termo is not None:
+        por_display = format_pt_amount(termo.valor_termo)
+        got = apply_por_fallback(
+            doc, output_path, termo_pages, invoice_indices, du_indices,
+            por_display, termo.ucr, stamp_date, dry_run,
+        )
+        if got is not None:
+            fb_report, stamped = got
+            print(f"FALLBACK-POR — missing {', '.join(missing) or 'none (strict markers only)'}; "
+                  f"POR found in Termo => full stamp")
+            print(f"POR (from Termo p{termo_pages[0] + 1}): {por_display}{POR_SUFFIX} | SALDO: {SALDO_TEXT}")
+            for pno, kind, r in stamped:
+                print(f"  p{pno} [{kind}] full: {r}")
+            if not dry_run:
+                print(f"Saved: {output_path}")
+            fb_report.print_report()
+            return fb_report
+    report, stamped = apply_date_fallback(
+        doc, output_path, termo_pages, invoice_indices, du_indices, stamp_date, dry_run,
+    )
+    print(f"FALLBACK — missing {', '.join(missing) or 'none (strict markers only)'}; "
+          f"POR not extractable => date-only stamp (POR/SALDO left blank for manual fill)")
+    for pno, kind, r in stamped:
+        print(f"  p{pno} [{kind}] date-only: {r}")
+    if not dry_run:
+        print(f"Saved: {output_path}")
+    report.print_report()
+    return report
 
 
 def select_du_by_ucr(doc: fitz.Document, du_indices: list[int], termo_ucr: str | None) -> int:
@@ -606,22 +741,10 @@ def apply_stamps(
     du_indices_all = find_du_pages(doc)
 
     if not (termo_indices and invoice_indices and du_indices_all):
-        missing = []
-        if not termo_indices:
-            missing.append("Termo de Compromisso")
-        if not invoice_indices:
-            missing.append("Tax Invoice / Commercial Invoice")
-        if not du_indices_all:
-            missing.append("Documento Único")
-        print(f"FALLBACK — missing {', '.join(missing)}; date-only stamp on non-Termo pages (POR/SALDO leave blank)")
-        report, stamped = apply_date_fallback(doc, output_path, termo_indices, invoice_indices, du_indices_all, stamp_date, dry_run)
         print(f"Input:  {input_path}")
         print(f"Output: {output_path}")
         print(f"Date:   {stamp_date}")
-        for pno, kind, r in stamped:
-            print(f"  p{pno} [{kind}] date-only: {r}")
-        if not dry_run:
-            print(f"\nSaved: {output_path}")
+        report = apply_auto_fallback(doc, output_path, termo_indices, invoice_indices, du_indices_all, stamp_date, dry_run)
         doc.close()
         report.print_report()
         return report
