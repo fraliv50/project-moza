@@ -16,10 +16,10 @@ ROOT = Path(__file__).resolve().parent.parent
 
 try:
     from macro_full import apply as apply_full
-    from core import today_pt, merge_pdfs, now_stamp, today_slug, outcome_to_row, error_row, skip_row, write_excel
+    from core import today_pt, merge_pdfs, today_slug, outcome_to_row, error_row, skip_row, write_excel
 except ImportError:
     from macro_processes.macro_full import apply as apply_full
-    from macro_processes.core import today_pt, merge_pdfs, now_stamp, today_slug, outcome_to_row, error_row, skip_row, write_excel
+    from macro_processes.core import today_pt, merge_pdfs, today_slug, outcome_to_row, error_row, skip_row, write_excel
 
 def find_termos_folders(root: Path) -> list[Path]:
     out = []
@@ -40,7 +40,6 @@ def process_termos_folder(src_folder: Path) -> list[dict]:
         return []
     print(f"[{src_folder.name}] {len(pdfs)} PDFs -> {dst_folder.name}  Date: {today_pt()}")
     ok = 0
-    ts = now_stamp()
     rows = []
     for pdf in sorted(pdfs):
         rel = pdf.relative_to(src_folder)
@@ -48,16 +47,16 @@ def process_termos_folder(src_folder: Path) -> list[dict]:
         out.parent.mkdir(parents=True, exist_ok=True)
         if out.exists():
             print(f"  SKIP {rel} already stamped")
-            rows.append(skip_row(str(rel), out.name, ts))
+            rows.append(skip_row(str(rel), out.name))
             continue
         try:
             oc = apply_full(pdf, out)
             ok += 1
             print(f"  OK {rel} -> {out.relative_to(dst_folder)}")
-            rows.append(outcome_to_row(oc, str(rel), ts))
+            rows.append(outcome_to_row(oc, str(rel)))
         except Exception as e:
             print(f"  FAIL {rel}: {e}")
-            rows.append(error_row(str(rel), out.name, str(e), ts))
+            rows.append(error_row(str(rel), out.name, str(e)))
     merged_name = "merged (!!).pdf"
     stamped_files = sorted(
         p for p in dst_folder.rglob("*.pdf")
@@ -90,8 +89,8 @@ def main(argv=None, watch: bool = False):
     def flush():
         if all_rows:
             xl = ROOT / f"processadas_{today_slug()}.xlsx"
-            write_excel(list(all_rows), xl)
-            print(f"Excel: {xl} ({len(all_rows)} rows)")
+            xl, n_rows = write_excel(list(all_rows), xl)
+            print(f"Excel: {xl} ({n_rows} row(s), {len(all_rows)} input)")
 
     flush()
     if args.watch or watch:

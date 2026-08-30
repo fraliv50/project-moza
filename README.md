@@ -1,38 +1,62 @@
 # MOZA Cambial Stamp — Automation
 
-Official rubber stamp from `test file.pdf` placed as **transparent overlay** (no white blocking) on Tax Invoice & Documento Único. Positions copied exactly from `example_1_fnb.pdf` blue Draft `Stamp` annots. Date is always **today** when program runs; `POR` value is the only field copied from Termo.
+Official rubber stamp from `test file.pdf` placed as **transparent overlay** (no white blocking) on Tax Invoice & Documento Único. Positions copied exactly from `example_1_fnb.pdf` blue Draft `Stamp` annots. Date is always **today** when the program runs; `POR` is the only value copied from the Termo.
+
+## Daily use (one command)
+
+1. **Drop PDFs** into a folder named `termos` in the project root (subfolders allowed).
+2. **Run:**
+   ```powershell
+   python macro_processes/termos_auto.py
+   ```
+   It processes every folder named `termos*` (`termos`, `termos1`, `termos2` … all count) and creates a sibling output folder `termos (!!)` mirroring the structure:
+   ```
+   termos/24LOC001.pdf        ->  termos (!!)/24LOC001 (!!).pdf
+   termos/batchA/20LOC002.pdf ->  termos (!!)/batchA/20LOC002 (!!).pdf
+   ```
+3. **You get everything:**
+   - **Stamped copies** `name (!!).pdf` — date (today) + `POR` + `SALDO 0,00 EUR` filled from that Termo (fallback modes when pages are missing, see below).
+   - **`termos (!!)/merged (!!).pdf`** — all stamped PDFs concatenated in order, for one-shot printing.
+   - **`processadas_<YYYY-MM-DD>.xlsx`** — the run record (7 columns, one row per bundle).
+
+Watch mode (auto-process new drops; Ctrl+C to stop):
+```powershell
+python macro_processes/termos_auto.py --watch
+```
+
+Notes:
+- **Already-stamped files are skipped** (`name (!!).pdf` exists). Delete `termos (!!)` to force a re-stamp.
+- **Date is always today** at runtime, regardless of the reference in the Termo.
 
 ## Files (kept for GitHub)
 
 ```
 project moza/
 ├─ test file.pdf              # blank stamp scan (source, keep)
-├─ example_1_fnb.pdf          # blue Draft — position reference (keep, do not move)
-├─ assets/stamp_template.png  # auto-extracted stamp (1240×693, auto-generated)
-├─ stamp_pdf.py               # single-file entry (future-proof)
-├─ termos/                    # drop PDFs here (gitignored, created empty)
+├─ example_1_fnb.pdf          # blue Draft — placement reference (keep)
+├─ assets/stamp_template.png  # extracted stamp template (auto-regenerated)
+├─ termos/                    # drop PDFs here (gitignored)
 ├─ extracted/                 # previews (gitignored)
-└─ macro_processes/
-   ├─ core.py                 # shared: TEXT_POS, UCR, placement — EDIT HERE
-   ├─ macro_blank.py          # 1) stamp only (no fields)
-   ├─ macro_date.py           # 2) stamp + today DD/MM/YYYY split
-   ├─ macro_full.py           # 3) stamp + today + POR + SALDO 0,00 (use this)
-   ├─ batch_stamp.py          # recursive batch with (!!) suffix
-   └─ termos_auto.py          # SIMPLEST: drop PDFs in ./termos/ -> auto creates ./termos (!!)/
+├─ macro_processes/
+│  ├─ core.py                 # shared logic, placement, stamp build — EDIT HERE
+│  ├─ macro_full.py           # stamps one file (date + POR + SALDO)
+│  └─ termos_auto.py          # the one-command entrypoint
+├─ requirements.txt
+├─ README.md
+└─ LICENSE
 ```
-Gitignored (not pushed): `20LOC*.pdf` `test 2.pdf` `* (!!).pdf` `extracted/` `termos (!!)/`
+
+Gitignored (not pushed): `termos/` `termos (!!)/` `20LOC*.pdf` `* (!!).pdf` `*_stamped*.pdf` `extracted/` `processadas_*.xlsx`
 
 ### Stamp fields
 
 | Blank on stamp | Filled with | Source |
 |---|---|---|
-| `UTILIZADO P/FINS CAMBIAIS EM ___/___/___` | `DD` `MM` `YYYY` split into 3 blanks, centered `anchor="mm"` | `today_pt()` at runtime |
-| `POR ___________________` | `9545,64 EUR` (example) | `Valor do Termo de Compromisso` from Termo page |
+| `UTILIZADO P/FINS CAMBIAIS EM ___/___/___` | `DD` `MM` `YYYY` in 3 blanks, centered | `today_pt()` at runtime |
+| `POR ___________________` | e.g. `9545,64 EUR` | `Valor do Termo de Compromisso` from Termo page |
 | `SALDO ________________` | `0,00 EUR` always | fixed |
 
-All text `32pt` uniform (`max(22, h*0.038+6)`), lifted `0.007` above lines so it doesn't touch, `POR` shifted **~3 chars left** `x=0.656` vs `0.68` to be centered in its long line.
-
-Text positions (`TEXT_POS` fractions of stamp image `w/h`):
+All text `32pt` uniform (`max(22, h*0.038+6)`), POR shifted **~3 chars left** `x=0.656` vs `0.68` to center in its long line. Text positions (`TEXT_POS` fractions of the stamp image `w/h`):
 
 ```
 d1 0.538,0.103  d2 0.633,0.103  d3 0.724,0.103
@@ -41,161 +65,82 @@ por 0.656,0.210  saldo 0.28,0.285
 
 ### Placement (from `example_1_fnb.pdf`)
 
-Extracted via `page.annots()` type `Stamp`:
-
 ```
 Invoice (p2): Rect(413.476, 651.229, 533.476, 681.279)
 DU      (p3): Rect(394.182, 781.424, 514.182, 811.474)
 ```
 
-`example_draft_rect(page, stamp_w, stamp_h, kind)` scales to page size `595×842` and clamps to `MARGIN 14` so the stamp stays visible. Tax Invoice & DU both follow draft. If you want Tax Invoice to prefer empty space first, `find_least_text_rect` falls back to draft when `overlap > 0.45*area`.
+`example_draft_rect(page, stamp_w, stamp_h, kind)` scales to page size `595×842` and clamps to `MARGIN 14`. The stamp ink is measured from the template and the placement rect is sized so the **visible** stamp is exactly `STAMP_INK_WIDTH_PT = 231.95 pt`. The DU stamp is lowered by `DU_DROP_SHARE = 1.10` of its visible height.
 
-### Page-agnostic & future-proof
+### Page-agnostic & validated
 
-- `find_all_pages_by_marker(doc, markers)` — Termo can be on any page, not just p1
-- `find_du_pages` filters `Continuação` pages
-- `select_du_by_ucr` matches `Número Único por Consignação (UCR)` e.g. `0MZ400010234687766` Termo ↔ DU to link correct bundle even if pages shuffled
-- **Invoices**: `find_all_pages_by_marker(["Tax Invoice","Commercial Invoice"])` → **ALL** stamped
-- **DUs**: only **FIRST** matching DU stamped (others ignored, continuation ignored)
-
-Validated via `ValidationReport`: UCR Termo↔DU, Invoice number triangle (`INVOICE:` on Termo ⇄ Tax Invoice ⇄ DU `13A Nº e data da factura`), Invoice Total ↔ Termo, DU FOB=Invoice FCA, DU Frete=Invoice Air Freight, DU CIF = FOB+FRETE+SEGURO, MT↔EUR conversion @ taxa de câmbio.
+- Termo can be on any page (`find_all_pages_by_marker`); DU continuation sheets are never stamped.
+- `select_du_by_ucr` links Termo ↔ DU via `Número Único por Consignação (UCR)` even if pages are shuffled.
+- **All Tax Invoices stamped**, only the **first** UCR-matched DU.
+- `ValidationReport` per file: UCR Termo↔DU, invoice-number triangle (`INVOICE:` on Termo ⇄ Tax Invoice ⇄ DU `13A Nº e data da factura`), Invoice Total ↔ Termo, DU FOB=Invoice FCA, DU Frete=Invoice Air Freight, DU CIF = FOB+FRETE+SEGURO, MT↔EUR conversion @ taxa de câmbio.
 
 ### Fallback (when full automation can't run)
 
-If Termo / Tax Invoice / Documento Único aren't **all** found (e.g. scanned pages, shuffled/misspelled text), the file is **no longer skipped** — the program walks a safe ladder, using whatever it *can* find:
+If Termo / Tax Invoice / Documento Único aren't **all** found, the file is **not skipped** — a safe ladder runs using whatever *can* be found:
 
-1. **POR-fill fallback** — if the Termo is found (strict or **liberal** scan of details only it has: `Termo de Compromisso de Intermediação Bancária para a Importação de Bens`, `intermediação bancária`, `importação de bens`, `compromisso`, accent-insensitive) **and** its `Valor do Termo de Compromisso` is extractable, the **FULL** stamp is used (`DD/MM/YYYY` + `POR` + `SALDO 0,00`) on every **identified** page — all Tax Invoices + the **first relevant DU** (UCR-matched when possible). This covers e.g. "invoice text is garbled but Termo+DU are fine".
-2. **Date-only fallback** — only when even POR can't be extracted: `DD/MM/YYYY` stamp on every page EXCEPT the Termo and DU continuations; POR/SALDO blank for manual fill.
-3. **Always skipped**: the Termo page and **`Documento Único (Continuação)`** sheets — only the first/main DU is ever stamped. If the Termo can't be identified even liberally, the file is **skipped** (stamped nothing) to avoid stamping an unknown page.
-4. Output prints `FALLBACK-POR` or `FALLBACK` so you know which mode ran. Normal bundles behave exactly as before (no fallback).
-
-### Merged output (print-all-at-once)
-
-While producing the individual ` (!!).pdf` copies, the batch/watch scripts also concatenate **all** of them into one file **in order**:
-
-- `batch_stamp.py` → `merged (!!).pdf` in the scanned root
-- `termos_auto.py` → `merged (!!).pdf` inside each `termos (!!)` output folder
+1. **POR-fill fallback** — Termo found (strict or liberal scan of details only it has) **and** `Valor do Termo de Compromisso` extractable → **FULL** stamp on every **identified** page (all invoices + first relevant DU).
+2. **Date-only fallback** — even POR not extractable → `DD/MM/YYYY` stamp on every page except the Termo and DU continuations; POR/SALDO blank for manual fill.
+3. **Never stamped**: Termo page and `Documento Único (Continuação)` sheets. If the Termo can't be identified even liberally, the file is **skipped** (nothing stamped).
+4. Output prints `FALLBACK-POR` or `FALLBACK` so you know which mode ran.
 
 ### Excel record (one workbook per run)
 
-At the end of every batch/watch run (`batch_stamp.py`, `termos_auto.py`) a workbook `processadas_<YYYY-MM-DD>.xlsx` is written (batch → scanned root, termos → project root):
+Written at the end of every run as `processadas_<YYYY-MM-DD>.xlsx` in the project root, with two sheets (pandas + openpyxl):
 
-- **`Processadas`** — one row per bundle: run metadata (`processado_em`, `resultado` OK/FALLBACK-POR/FALLBACK-DATA/ERRO/SKIP, `ficheiro_origem`, `ficheiro_carimbado`, `detalhe_erro`, `paginas_carimbadas`), Termo party/IDs (`ref_termo`, `ucr`, `data_emissao`, `banco_emitente`, `modalidade`, `regime`, `transporte`, `mercadoria`, exporter/importer `nuit_/nome_/pais_`), EUR amounts (`valor_termo_eur`, `valor_factura_termo_eur`, `fca_eur`, `frete_eur`, `total_factura_eur`, `fob_eur`, `seguro_eur`, `frete_du_eur`, `cif_eur`), key IDs (`nr_factura`, `dt_factura`, `nr_declaracao`, `data_liquidacao`), `validacao_checks` (e.g. `13/13`) and `warns`.
-- **`Resumo`** — count per `resultado` plus `TOTAIS NAO-ERRO` sums of POR / CIF / total factura.
+- **`Processadas`** — 7 priority columns per bundle: `resultado` (OK/FALLBACK-POR/FALLBACK-DATA/ERRO/SKIP), `ficheiro_origem`, `ucr`, `ref_termo`, `valor_termo_eur` (POR), `total_factura_eur`, `nr_factura`.
+- **`Resumo`** — count per `resultado` plus `TOTAIS NAO-ERRO` sums of POR / total factura.
 
-Amounts are numbers, dates ISO `YYYY-MM-DD`, missing fields stay blank. No output is written on `--dry-run`.
+Rows are **deduplicated by bundle** (UCR, else ref_termo, else file name): the same bundle in several input files yields **one** row, keeping the best outcome. Amounts are numbers; missing fields are blank.
 
-## Setup on another laptop (quick)
+## Setup on another laptop
 
-1. **Copy folder** `project moza` as-is (keep `test file.pdf`, `example_1_fnb.pdf`, `assets/`)
-
-2. **Python 3.11+** — https://python.org/downloads/ — check `python --version`
-
-3. **Install deps** (one-time, in project folder):
-```powershell
-python -m pip install --upgrade pip
-python -m pip install pymupdf Pillow numpy pandas openpyxl
-# if you have requirements.txt:
-# pip install -r requirements.txt
-```
-
-4. **Test single file**:
-```powershell
-python macro_processes/macro_full.py ".\20LOC00566833_FNB.pdf"
-# or
-python stamp_pdf.py ".\20LOC00566833_FNB.pdf"
-# output: 20LOC00566833_FNB_stamped_full.pdf  (or _stamped.pdf)
-# with --date override:  python macro_processes/macro_full.py "file.pdf" --date 27/08/2026
-```
-
-5. **Batch all folders** (1000s of `*LOC*.pdf`):
-```powershell
-# from project root:
-python macro_processes/batch_stamp.py "D:\path\to\LOC_root"
-# optional pattern:
-python macro_processes/batch_stamp.py "D:\LOC" --pattern "*LOC*.pdf"
-# dry-run (validate only):
-python macro_processes/batch_stamp.py "D:\LOC" --dry-run
-```
-Output is **same folder** with ` (!!)` suffix to mark stamped:
-```
-20LOC00566833_FNB.pdf  ->  20LOC00566833_FNB (!!).pdf
-24LOC001234.pdf        ->  24LOC001234 (!!).pdf
-```
-Already stamped `* (!!).pdf` are skipped.
-
-5b. **Simplest — termos folder (as you requested)**:
-Just create a folder named `termos` in this codebase and drop PDFs inside (any subfolders). Run once:
-```powershell
-python macro_processes/termos_auto.py
-```
-It finds every folder named `termos*` in project root (so `termos`, `termos1`, `termos2` etc auto-numbered by you) and creates sibling `termos (!!)` / `termos1 (!!)` preserving structure:
-```
-termos/24LOC001.pdf  ->  termos (!!)/24LOC001 (!!).pdf
-termos/batchA/20LOC002.pdf -> termos (!!)/batchA/20LOC002 (!!).pdf
-```
-Watch mode (auto-process new drops):
-```powershell
-python macro_processes/termos_auto.py --watch
-```
-
-## The 3 macro versions
-
-| Macro | Use when | Output suffix | Command |
-|---|---|---|---|
-| `macro_blank.py` | stamp only, fill manually | `_stamped_blank.pdf` | `python macro_processes/macro_blank.py "file.pdf"` |
-| `macro_date.py` | stamp + today date only | `_stamped_date.pdf` | `python macro_processes/macro_date.py "file.pdf"` |
-| `macro_full.py` | **production** stamp+date+POR+SALDO | `_stamped_full.pdf` | `python macro_processes/macro_full.py "file.pdf"` |
-
-All share `core.py` placement & UCR logic. For batch, `batch_stamp.py` calls `macro_full`.
-
-## Naming convention
-
-Files like `20LOC...`, `22LOC...`, `24LOC...` — leading `20`/`22`/`24` is year, not used for logic (date always today). Batch keeps **exact same name** plus ` (!!)` before `.pdf`.
+1. **Copy the folder** as-is (keep `test file.pdf`, `example_1_fnb.pdf`, `assets/`).
+2. **Python 3.11+** — https://python.org/downloads/ — check `python --version`.
+3. **Install deps** (one-time):
+   ```powershell
+   python -m pip install -r requirements.txt
+   ```
+4. **Create a `termos` folder**, drop PDFs in, and run:
+   ```powershell
+   python macro_processes/termos_auto.py
+   ```
 
 ## Adjusting char size & stamp placement (easy)
 
-All adjustable in **2 files**: `macro_processes/core.py` and `stamp_pdf.py` (same constants). No rebuild needed — `assets/stamp_template.png` auto-cached.
+Everything adjustable in **one file**: `macro_processes/core.py`. No rebuild needed — `assets/stamp_template.png` auto-caches.
 
-**Char size** — `core.py` `build_full_stamp`:
+**Char size** — `build_full_stamp`:
 ```python
-base_size = max(22, int(h * 0.038) + 6)  # h=693 → 32pt now; +6 = +2 bump vs previous
+base_size = max(22, int(h * 0.038) + 6)  # h=693 -> 32pt now
 # larger: +8 (34pt), smaller: +4 (30pt), or fixed: base_size = 28
-fonts = {"d1": _load_font(base_size), "por": _load_font(base_size), ...}  # all uniform
 ```
-Increase `+6` → `+8` for +2pt, or set `base_size = 36` for big. All fields `d1/d2/d3/por/saldo` share it.
 
-**Text position in stamp** — `TEXT_POS` fractions of stamp image `w=1240 h=693`:
+**Text position in stamp** — `TEXT_POS` fractions of `w=1240 h=693`:
 ```python
 TEXT_POS = {"d1":(0.538,0.103), "d2":(0.633,0.103), "d3":(0.724,0.103), "por":(0.656,0.210), "saldo":(0.28,0.285)}
-# x 0→1 left→right, y 0→1 top→bottom, anchor="mm" centered
-# POR was 0.68 → 0.656 (~3 chars left) to center in long line
 # nudge: y -0.005 = up ~3.5px, x +0.01 = right ~12px
 ```
 
-**Stamp placement & size** — `core.py` `example_draft_rect` + `STAMP_INK_WIDTH_PT`:
+**Stamp size & placement** — constants + `example_draft_rect`:
 ```python
-STAMP_INK_WIDTH_PT = 231.95  # original stamp ink on test file.pdf: 231.95 x 75.99 pt (measured)
-# stamp_template.png keeps paper margins, so stamp_rect_size() measures the template ink
-# fraction once and widens the placed rect until the VISIBLE stamp = 231.95 pt exactly.
+STAMP_INK_WIDTH_PT = 231.95  # visible stamp ink width in pt (measured from test file.pdf)
 MARGIN = 14.0
-DU_DROP_SHARE = 1.10  # DU stamp lowered by 110% of its visible height (30%+30%+50%) ("du" kind only)
+DU_DROP_SHARE = 1.10         # DU stamp lowered by 110% of visible height ("du" kind only)
 # from example_1_fnb.pdf blue Draft annots:
-# invoice x0_src,y0_src = 413.47,651.22  du = 394.18,781.42 (for 595×842 page)
+# invoice x0_src,y0_src = 413.47,651.22   du = 394.18,781.42 (for 595x842 page)
 # scaled: x0 = x0_src * (pw/595), y0 = y0_src * (ph/842), then clamped to MARGIN
 ```
-Move stamp: change `x0_src`/`y0_src` (e.g. `y0_src+20` = down). Bigger/smaller stamp: change `STAMP_INK_WIDTH_PT` (width of visible ink in pt). DU drop: adjust `DU_DROP_SHARE` (`0` = back to draft position).
-
-After edit, test: `python macro_processes/macro_full.py ".\termos\test.pdf"` and check `extracted/trials/stamp_*.png`.
+Move stamp: change `x0_src`/`y0_src` (e.g. `y0_src+20` = down). Bigger/smaller: change `STAMP_INK_WIDTH_PT`. DU drop: adjust `DU_DROP_SHARE` (`0` = draft position).
 
 ## Troubleshooting
 
 - `Stamp source not found: test file.pdf` → keep `test file.pdf` in project root
-- `Termo/Invoice/DU page not found` → PDF must contain those markers text (Termo de Compromisso, Tax Invoice, DOCUMENTO ÚNICO)
-- `already exists SKIP` in batch → delete ` (!!).pdf` or run on copy
-- Stamp text touches line → adjust `TEXT_POS` y `-0.005` in `core.py`/`stamp_pdf.py` and rebuild `assets/stamp_template.png` if needed
-- Need different stamp size → change `STAMP_INK_WIDTH_PT = 231.95` in `core.py` (and `stamp_pdf.py`)
-
-## Closing changes placeholder
-
-Positions are now locked to `example_1_fnb.pdf` draft. Before closing, confirm `TEXT_POS` POR `0.656` shift and `batch_stamp` ` (!!)` naming.
+- `all automation AND Termo page not found` → the PDF has no Termo text at all; file is skipped intentionally
+- `SKIP already stamped` → output exists in `termos (!!)`; delete it to re-stamp
+- `PermissionError` writing the Excel → close `processadas_*.xlsx` if it's open in Excel
+- Stamp text touches the line → adjust `TEXT_POS` y in `core.py`

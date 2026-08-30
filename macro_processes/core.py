@@ -859,16 +859,8 @@ class BundleOutcome:
     inv_date: str = ""
 
 EXCEL_COLUMNS = [
-    "processado_em", "resultado", "ficheiro_origem", "ficheiro_carimbado",
-    "detalhe_erro", "paginas_carimbadas",
-    "ref_termo", "ucr", "data_emissao", "banco_emitente", "modalidade",
-    "regime", "transporte", "mercadoria",
-    "nuit_exportador", "nome_exportador", "pais_exportador",
-    "nuit_importador", "nome_importador", "pais_importador",
-    "valor_termo_eur", "valor_factura_termo_eur",
-    "nr_factura", "dt_factura", "fca_eur", "frete_eur", "total_factura_eur",
-    "nr_declaracao", "fob_eur", "seguro_eur", "frete_du_eur", "cif_eur", "data_liquidacao",
-    "validacao_checks", "warns",
+    "resultado", "ficheiro_origem", "ucr", "ref_termo",
+    "valor_termo_eur", "total_factura_eur", "nr_factura",
 ]
 
 def _iso_date(s: str | None) -> str | None:
@@ -886,83 +878,56 @@ def today_slug() -> str:
     d = date.today()
     return f"{d.year:04d}-{d.month:02d}-{d.day:02d}"
 
-def now_stamp() -> str:
-    from datetime import datetime
-    return datetime.now().strftime("%Y-%m-%d %H:%M")
-
-def outcome_to_row(oc: BundleOutcome, input_name: str, processed_at: str) -> dict:
-    row = {c: None for c in EXCEL_COLUMNS}
+def outcome_to_row(oc: BundleOutcome, input_name: str) -> dict:
     t = oc.termo
-    du = oc.du
-    inv = oc.inv or {}
     inv_no = oc.inv_no or ""
-    inv_date = oc.inv_date or ""
-    if not inv_no and du and du.invoice_ref:
-        inv_no = du.invoice_ref
-    if not inv_date and du and du.invoice_date:
-        inv_date = _iso_date(du.invoice_date) or ""
-    row.update({
-        "processado_em": processed_at,
+    if not inv_no and oc.du and oc.du.invoice_ref:
+        inv_no = oc.du.invoice_ref
+    return {
         "resultado": oc.result,
         "ficheiro_origem": input_name,
-        "ficheiro_carimbado": oc.output_name,
-        "detalhe_erro": oc.error,
-        "paginas_carimbadas": oc.stamped_pages,
-    })
-    if t is not None:
-        row.update({
-            "ref_termo": t.ref_termo,
-            "ucr": t.ucr,
-            "data_emissao": t.data_emissao,
-            "banco_emitente": t.banco_emitente,
-            "modalidade": t.modalidade,
-            "regime": t.regime,
-            "transporte": t.transporte,
-            "mercadoria": t.mercadoria,
-            "nuit_exportador": t.nuit_exportador,
-            "nome_exportador": t.nome_exportador,
-            "pais_exportador": t.pais_exportador,
-            "nuit_importador": t.nuit_importador,
-            "nome_importador": t.nome_importador,
-            "pais_importador": t.pais_importador,
-            "valor_termo_eur": t.valor_termo,
-            "valor_factura_termo_eur": t.valor_factura,
-        })
-    row["nr_factura"] = inv_no
-    row["dt_factura"] = inv_date
-    if du is not None:
-        row.update({
-            "nr_declaracao": du.decl_no,
-            "fob_eur": du.fob,
-            "seguro_eur": du.insurance,
-            "frete_du_eur": du.freight,
-            "cif_eur": du.cif,
-            "data_liquidacao": du.liqui_iso,
-        })
-    if inv:
-        row.update({
-            "fca_eur": inv.get("goods"),
-            "frete_eur": inv.get("freight"),
-            "total_factura_eur": inv.get("total"),
-        })
-    if oc.checks_total:
-        row["validacao_checks"] = f"{oc.checks_ok}/{oc.checks_total}"
-    row["warns"] = oc.warns or None
-    return row
+        "ucr": t.ucr if t else None,
+        "ref_termo": t.ref_termo if t else None,
+        "valor_termo_eur": t.valor_termo if t else None,
+        "total_factura_eur": (oc.inv or {}).get("total"),
+        "nr_factura": inv_no or None,
+    }
 
-def error_row(input_name: str, output_name: str, error: str, processed_at: str) -> dict:
+def error_row(input_name: str, output_name: str, error: str) -> dict:
     oc = BundleOutcome(result="ERRO", input_name=input_name, output_name=output_name, error=error)
-    return outcome_to_row(oc, input_name, processed_at)
+    return outcome_to_row(oc, input_name)
 
-def skip_row(input_name: str, output_name: str, processed_at: str) -> dict:
+def skip_row(input_name: str, output_name: str) -> dict:
     oc = BundleOutcome(result="SKIP", input_name=input_name, output_name=output_name)
-    return outcome_to_row(oc, input_name, processed_at)
+    return outcome_to_row(oc, input_name)
 
-def write_excel(rows: list[dict], output_path: Path, summary: bool = True) -> Path:
-    """Write one workbook per run: 'Processadas' (one row per bundle) + 'Resumo'."""
+def write_excel(rows: list[dict], output_path: Path, summary: bool = True) -> tuple[Path, int]:
+    """Write one workbook per run: 'Processadas' (one row per bundle) + 'Resumo'.
+
+    Rows are deduplicated by bundle identity (UCR, else ref_termo, else file name):
+    a bundle appearing in several input files yields ONE row, preferring the best
+    outcome (OK > FALLBACK-POR > FALLBACK-DATA > SKIP > ERRO). Returns (path, n).
+    """
     import pandas as pd
     output_path = Path(output_path)
     df = pd.DataFrame([{c: r.get(c) for c in EXCEL_COLUMNS} for r in rows])
+    order = {"OK": 0, "FALLBACK-POR": 1, "FALLBACK-DATA": 2, "SKIP": 3, "ERRO": 4}
+    seen: dict[str, int] = {}
+    keep: list[dict] = []
+    for row in df.to_dict("records"):
+        key = row.get("ucr") or row.get("ref_termo") or row.get("ficheiro_origem")
+        if key is None:
+            keep.append(row)
+            continue
+        key = str(key).strip()
+        rank = order.get(str(row.get("resultado")), 5)
+        idx = seen.get(key)
+        if idx is None:
+            seen[key] = len(keep)
+            keep.append(row)
+        elif rank < order.get(str(keep[idx].get("resultado")), 5):
+            keep[idx] = row
+    df = pd.DataFrame(keep, columns=EXCEL_COLUMNS)
     with pd.ExcelWriter(output_path, engine="openpyxl") as xw:
         df.to_excel(xw, sheet_name="Processadas", index=False)
         if summary and len(df):
@@ -972,7 +937,6 @@ def write_excel(rows: list[dict], output_path: Path, summary: bool = True) -> Pa
             ok_df = df[df["resultado"].fillna("") != "ERRO"]
             money = {
                 "Somatorio POR (EUR)": "valor_termo_eur",
-                "Somatorio CIF (EUR)": "cif_eur",
                 "Somatorio Total Factura (EUR)": "total_factura_eur",
             }
             row = {"Resultado": "TOTAIS NAO-ERRO", "N": len(ok_df)}
@@ -981,4 +945,4 @@ def write_excel(rows: list[dict], output_path: Path, summary: bool = True) -> Pa
                 row[label] = float(vals.sum()) if vals.notna().any() else 0.0
             sum_rows.append(row)
             pd.DataFrame(sum_rows).to_excel(xw, sheet_name="Resumo", index=False)
-    return output_path
+    return output_path, len(df)

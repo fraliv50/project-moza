@@ -10,6 +10,7 @@ termos (!!)/
 *_final.pdf
 test_multi.pdf
 test_agnostic.pdf
+processadas_*.xlsx
 # keep only templates, ignore real bundles
 20LOC*.pdf
 22LOC*.pdf
